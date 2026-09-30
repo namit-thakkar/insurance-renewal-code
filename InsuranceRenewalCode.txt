@@ -1,0 +1,2953 @@
+/**
+ * ======================================================================================
+ * INSURANCE RENEWAL NOTICE AUTOMATION  —  v4 (FLASH-LITE SPEED)
+ * ======================================================================================
+ * All original features intact. Speed-only changes vs v3:
+ *
+ *  - Prefers gemini-2.5-flash-lite. If Google 404s it for this API key (common for
+ *    new keys: "no longer available to new users"), uses gemini-3.5-flash-lite
+ *    then gemini-3.1-flash-lite. Still ONE model per run after the first hit.
+ *  - Thinking off/minimal so Flash-Lite returns JSON immediately.
+ *  - Batch path sends the PDF on the first round (skips slow Apps Script text scraping
+ *    that was causing a wasted Gemini call + 2.5s pause + full-PDF retry).
+ *  - Retry only for transient errors (503 / 429 / empty / parse), same model, no 2.5s sleep.
+ *  - PDF base64 is encoded once and reused if a retry is needed.
+ * ======================================================================================
+ */
+
+// ======================================================================================
+// 1. CONFIGURATION & CONSTANTS
+// ======================================================================================
+
+const CONFIG = {
+  // Sender Branding
+  SENDER_NAME: 'Ajay Thakkar',
+  SENDER_WEBSITE: 'at-insurance.health',
+  SENDER_PHONE: '9818357595',
+
+  // Gemini API Version
+  GEMINI_API_VERSION: 'v1beta',
+
+  // New API keys are blocked from gemini-2.5-flash-lite, and Gemini 3.5+
+  // returns HTTP 400 if temperature is sent. Prefer 3.5 Flash-Lite.
+  // Still ONE model per run after the first successful hit.
+  GEMINI_MODEL: 'gemini-3.5-flash-lite',
+  GEMINI_FALLBACK_MODELS: ['gemini-3.1-flash-lite', 'gemini-2.5-flash-lite'],
+
+  // Parallel Batch Concurrency (all files fire in one parallel round)
+  CONCURRENCY: 10,
+
+  // Batch Execution Limit
+  MAX_FILES_PER_RUN: 10,
+
+  // Tiny pause used ONLY when a 503/429 retry is needed (ms)
+  RETRY_PAUSE_MS: 400,
+
+  // Safety cutoff so the script never hits the hard Apps Script timeout mid-write
+  MAX_RUNTIME_MS: 280000,
+
+  // Sheet Names
+  SHEET_MASTER_DATA: 'Master Data',
+  SHEET_MONTHLY_SUMMARY: 'Monthly Summary',
+
+  // Folder Names (Created during setup)
+  MASTER_FOLDER_NAME: '\uD83D\uDCC1 Insurance Renewals Master',
+  INBOX_FOLDER_NAME: '\uD83D\uDCE5 INBOX',
+  NEEDS_REVIEW_FOLDER_NAME: '\u26A0\uFE0F NEEDS REVIEW',
+
+  // Script Property Keys (Securely stored per user/sheet)
+  PROP_GEMINI_KEY: 'GEMINI_API_KEY',
+  PROP_MASTER_FOLDER_ID: 'MASTER_FOLDER_ID',
+  PROP_INBOX_FOLDER_ID: 'INBOX_FOLDER_ID',
+  PROP_NEEDS_REVIEW_FOLDER_ID: 'NEEDS_REVIEW_FOLDER_ID',
+  PROP_ACTIVE_MODEL: 'CACHED_GEMINI_MODEL',
+  PROP_MODELS_LIST: 'CACHED_GEMINI_MODEL_LIST',
+
+  // Preferred first. 2.5 is last because new keys are rejected.
+  MODEL_PRIORITY: ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-2.5-flash-lite'],
+
+  // Master Sheet Column Indices (1-indexed)
+  COLS: {
+    SR_NO: 1,           // A: Serial Number
+    CLIENT_NAME: 2,     // B: Client Name
+    RENEWAL_DATE: 3,    // C: Renewal Date (YYYY-MM-DD)
+    MONTH: 4,           // D: Month (e.g. September 2026)
+    COMPANY: 5,         // E: Insurance Company
+    POLICY_NO: 6,       // F: Policy Number
+    CLIENT_MOBILE: 7,   // G: Client Mobile / Phone
+    CLIENT_EMAIL: 8,    // H: Client Email
+    WHATSAPP_LINK: 9,   // I: Clickable WhatsApp Link
+    EMAIL_ACTION: 10,   // J: Clickable Gmail Compose Link
+    FILE_NAME: 11,      // K: Standardized File Name
+    FILE_LINK: 12,      // L: Clickable Link to PDF
+    FOLDER_NAME: 13,    // M: Destination Folder Name
+    FOLDER_LINK: 14,    // N: Clickable Link to Folder
+    STATUS: 15,         // O: Processing Status
+    DATE_PROCESSED: 16, // P: Timestamp
+    ORIGINAL_NAME: 17,  // Q: Original Uploaded Name
+    FILE_ID: 18,        // R: Drive File ID (Duplicate prevention helper)
+    NOTES: 19           // S: Notes / Error Reason
+  }
+};
+
+// Known Insurance Companies Mapping for Consistent Clean Naming
+const COMPANY_MAP = {
+  'niva bupa': 'NIVA',
+  'max bupa': 'NIVA',
+  'niva': 'NIVA',
+  'hdfc ergo': 'HDFC_ERGO',
+  'hdfc': 'HDFC_ERGO',
+  'icici lombard': 'ICICI_LOMBARD',
+  'icici prudential': 'ICICI_PRU',
+  'icici': 'ICICI_LOMBARD',
+  'star health': 'STAR_HEALTH',
+  'star': 'STAR_HEALTH',
+  'care health': 'CARE',
+  'care': 'CARE',
+  'religare': 'CARE',
+  'tata aig': 'TATA_AIG',
+  'tata': 'TATA_AIG',
+  'bajaj allianz': 'BAJAJ_ALLIANZ',
+  'bajaj': 'BAJAJ_ALLIANZ',
+  'new india assurance': 'NEW_INDIA',
+  'new india': 'NEW_INDIA',
+  'united india': 'UNITED_INDIA',
+  'national insurance': 'NATIONAL_INSURANCE',
+  'oriental insurance': 'ORIENTAL_INSURANCE',
+  'go digit': 'DIGIT',
+  'digit': 'DIGIT',
+  'sbi general': 'SBI_GENERAL',
+  'sbi': 'SBI_GENERAL',
+  'aditya birla': 'ADITYA_BIRLA',
+  'reliance general': 'RELIANCE_GENERAL',
+  'reliance': 'RELIANCE_GENERAL',
+  'universal sompo': 'UNIVERSAL_SOMPO',
+  'kotak mahindra': 'KOTAK',
+  'kotak general': 'KOTAK',
+  'kotak': 'KOTAK',
+  'royal sundaram': 'ROYAL_SUNDARAM',
+  'magma hdi': 'MAGMA_HDI',
+  'future generali': 'FUTURE_GENERALI',
+  'iffco tokio': 'IFFCO_TOKIO',
+  'manipalcigna': 'MANIPAL_CIGNA',
+  'manipal cigna': 'MANIPAL_CIGNA',
+  'cholamandalam': 'CHOLA_MS',
+  'chola ms': 'CHOLA_MS',
+  'liberty': 'LIBERTY',
+  'raheja qbe': 'RAHEJA_QBE',
+  'acko': 'ACKO',
+  'navi': 'NAVI',
+  'lic': 'LIC',
+  'life insurance corporation': 'LIC'
+};
+
+// In-execution caches (reset automatically on every new run)
+const _SHARE_CACHE = {};   // fileId -> true once "anyone with link" has been applied
+const _FOLDER_CACHE = {};  // parentId::name -> Folder object
+let _CACHED_MODELS_LIST = null;
+let _ACTIVE_WORKING_MODEL = null;
+
+// ======================================================================================
+// 2. CUSTOM MENU & UI TRIGGERS
+// ======================================================================================
+
+function onOpen(e) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    if (ss) {
+      const masterSheet = ss.getSheetByName(CONFIG.SHEET_MASTER_DATA);
+      if (masterSheet) ensureMasterDataSchema(masterSheet);
+    }
+  } catch (err) {
+    Logger.log('Auto-migration check notice: ' + err.toString());
+  }
+
+  try {
+    const ui = SpreadsheetApp.getUi();
+    ui.createMenu('\uD83D\uDEE1\uFE0F RENEWAL AUTOMATION')
+      .addItem('\uD83C\uDF10 0. Open Web App Dashboard (Full Portal)', 'openWebAppDialog')
+      .addItem('\uD83D\uDCF1 1. Open Action Center (Sidebar)', 'showRenewalSidebar')
+      .addSeparator()
+      .addItem('\uD83D\uDCE5 2. Process Inbox (Max 10 PDFs)', 'menuProcessInbox')
+      .addItem('\u26A0\uFE0F 3. Process Needs Review Folder', 'menuProcessNeedsReview')
+      .addSeparator()
+      .addItem('\uD83D\uDCAC 4. Open WhatsApp for Selected Row', 'sendWhatsAppSelectedRow')
+      .addItem('\uD83D\uDCE7 5. Open Gmail Compose for Selected Row', 'sendEmailReminderSelectedRow')
+      .addItem('\uD83D\uDD13 6. Make All PDFs Publicly Viewable (No Login Needed)', 'makeAllFilesPubliclyViewable')
+      .addSeparator()
+      .addItem('\u2699\uFE0F 7. Setup / Initialize System', 'setupSystem')
+      .addItem('\uD83D\uDD04 8. Upgrade / Fix Sheet Columns', 'menuUpgradeSchema')
+      .addItem('\uD83D\uDCCA 9. Refresh Monthly Summary', 'refreshMonthlySummary')
+      .addSeparator()
+      .addItem('\uD83D\uDD11 10. Set / Update Gemini API Key', 'promptSetApiKey')
+      .addItem('\uD83D\uDCC1 11. View Configured Folders & Info', 'showSystemInfo')
+      .addItem('\uD83D\uDD0D 12. Test Gemini API Connection', 'testGeminiConnection')
+      .addItem('\uD83D\uDD2C 13. Diagnose Extraction on 1 PDF', 'diagnoseOneFile')
+      .addItem('\uD83C\uDF10 14. Check Drive Public Sharing Status', 'testDrivePublicSharingStatus')
+      .addToUi();
+  } catch (err) {
+    Logger.log('Notice: onOpen() runs automatically when opening the Google Sheet in your browser.');
+  }
+}
+
+function openWebAppDialog() {
+  const ui = SpreadsheetApp.getUi();
+  const url = ScriptApp.getService().getUrl();
+  if (url) {
+    const html = HtmlService.createHtmlOutput(
+      '<div style="font-family: Arial, sans-serif; padding: 18px; text-align: center;">' +
+      '<h3 style="color: #1E3A8A; margin-bottom: 8px;">\uD83C\uDF10 Ajay Thakkar Renewal Portal</h3>' +
+      '<p style="font-size: 13px; color: #475569; margin-bottom: 14px;">Open your executive web dashboard in a new browser tab:</p>' +
+      '<a href="' + url + '" target="_blank" style="display: inline-block; background-color: #2563EB; color: white; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: bold; font-size: 14px;">\uD83D\uDC49 Open Web Portal</a>' +
+      '<br><br><p style="font-size: 11px; color: #94A3B8;">Tip: Bookmark this URL on your browser or mobile phone home screen for 1-tap access!</p></div>'
+    ).setWidth(420).setHeight(220);
+    ui.showModalDialog(html, 'Web App Portal');
+  } else {
+    ui.alert(
+      'Web App Setup Guide',
+      'To enable your 1-click Web Portal link:\n\n' +
+      '1. In Apps Script editor, click "Deploy" (top right) > "New deployment".\n' +
+      '2. Click the gear icon > Select "Web app".\n' +
+      '3. Set "Execute as": Me\n' +
+      '4. Set "Who has access": Anyone\n' +
+      '5. Click "Deploy" and copy your Web App URL!',
+      ui.ButtonSet.OK
+    );
+  }
+}
+
+function menuUpgradeSchema() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(CONFIG.SHEET_MASTER_DATA) || setupMasterDataSheet(ss);
+  migrateMasterDataSchema(sheet);
+  SpreadsheetApp.getUi().alert('Columns Upgraded', 'Master Data sheet has been updated to the full 19-column layout with 1-click WhatsApp & Gmail actions.', SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+/**
+ * Real-time reactive trigger: regenerates WhatsApp & Gmail links on edit.
+ */
+function onEdit(e) {
+  if (!e || !e.range) return;
+  try {
+    const sheet = e.range.getSheet();
+    if (sheet.getName() !== CONFIG.SHEET_MASTER_DATA) return;
+
+    const row = e.range.getRow();
+    const col = e.range.getColumn();
+    if (row <= 1) return;
+
+    if (
+      col === CONFIG.COLS.CLIENT_MOBILE ||
+      col === CONFIG.COLS.CLIENT_EMAIL ||
+      col === CONFIG.COLS.CLIENT_NAME ||
+      col === CONFIG.COLS.RENEWAL_DATE ||
+      col === CONFIG.COLS.COMPANY ||
+      col === CONFIG.COLS.POLICY_NO
+    ) {
+      const rowData = sheet.getRange(row, 1, 1, CONFIG.COLS.NOTES).getValues()[0];
+      const clientName = String(rowData[CONFIG.COLS.CLIENT_NAME - 1] || '');
+      const renewalDate = String(rowData[CONFIG.COLS.RENEWAL_DATE - 1] || '');
+      const company = String(rowData[CONFIG.COLS.COMPANY - 1] || '');
+      const policyNo = String(rowData[CONFIG.COLS.POLICY_NO - 1] || '');
+      const mobile = String(rowData[CONFIG.COLS.CLIENT_MOBILE - 1] || '');
+      const email = String(rowData[CONFIG.COLS.CLIENT_EMAIL - 1] || '');
+      const rawFileId = String(rowData[CONFIG.COLS.FILE_ID - 1] || '');
+
+      let fileFormula = '';
+      try { fileFormula = sheet.getRange(row, CONFIG.COLS.FILE_LINK).getFormula(); } catch (e2) {}
+
+      const fileId = extractDriveFileId(rawFileId) || extractDriveFileId(fileFormula);
+      const fileUrl = buildDriveViewUrl(fileId);
+
+      const whatsappUrl = generateWhatsAppLink(mobile, clientName, company, renewalDate, fileUrl, policyNo);
+      const gmailUrl = generateGmailComposeLink(email, clientName, company, renewalDate, fileUrl, policyNo);
+
+      sheet.getRange(row, CONFIG.COLS.WHATSAPP_LINK, 1, 2).setValues([[
+        whatsappUrl ? '=HYPERLINK("' + whatsappUrl + '", "\uD83D\uDCAC Send WhatsApp")' : '\u2014',
+        gmailUrl ? '=HYPERLINK("' + gmailUrl + '", "\uD83D\uDCE7 Send Gmail")' : '\u2014'
+      ]]);
+    }
+  } catch (err) {
+    console.error('onEdit trigger error: ' + err.toString());
+  }
+}
+
+function menuProcessInbox() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const result = processInbox();
+    let msg = 'Processed: ' + result.processed + ' PDFs in ' + result.elapsedSeconds + 's\n\n' +
+      '\u2022 Success: ' + result.success + '\n' +
+      '\u2022 Sent to Needs Review: ' + result.needsReview + '\n' +
+      '\u2022 Skipped (Duplicates): ' + result.skipped + '\n' +
+      '\u2022 Remaining in Inbox: ' + result.remaining;
+    if (result.overloaded > 0) {
+      msg += '\n\n\u26A0\uFE0F ' + result.overloaded + ' file(s) failed because the Gemini model was ' +
+             'temporarily overloaded (HTTP 503). This is a Google-side capacity issue, not your data. ' +
+             'Wait 2-3 minutes and run "Process Needs Review Folder".';
+    }
+    ui.alert('Inbox Processing Completed', msg, ui.ButtonSet.OK);
+  } catch (err) {
+    ui.alert('Error Processing Inbox', err.message, ui.ButtonSet.OK);
+  }
+}
+
+function menuProcessNeedsReview() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const result = processNeedsReview();
+    let msg = 'Processed: ' + result.processed + ' PDFs in ' + result.elapsedSeconds + 's\n\n' +
+      '\u2022 Successfully Resolved: ' + result.success + '\n' +
+      '\u2022 Still in Needs Review: ' + result.needsReview + '\n' +
+      '\u2022 Remaining in Folder: ' + result.remaining;
+    if (result.overloaded > 0) {
+      msg += '\n\n\u26A0\uFE0F ' + result.overloaded + ' file(s) hit HTTP 503 (model overloaded). ' +
+             'Wait a few minutes and run this again.';
+    }
+    ui.alert('Needs Review Processing Completed', msg, ui.ButtonSet.OK);
+  } catch (err) {
+    ui.alert('Error Processing Needs Review', err.message, ui.ButtonSet.OK);
+  }
+}
+
+// ======================================================================================
+// 3. ZERO-FRICTION FIRST-TIME SETUP FLOW (ACCOUNT AGNOSTIC)
+// ======================================================================================
+
+function setupSystem() {
+  const ui = SpreadsheetApp.getUi();
+  const props = PropertiesService.getScriptProperties();
+
+  let apiKey = props.getProperty(CONFIG.PROP_GEMINI_KEY);
+  if (!apiKey) {
+    const response = ui.prompt(
+      'Gemini API Key Required',
+      'Please enter your Google Gemini API Key:\n(Get your free key at https://aistudio.google.com/app/apikey)',
+      ui.ButtonSet.OK_CANCEL
+    );
+    if (response.getSelectedButton() !== ui.Button.OK) {
+      ui.alert('Setup Cancelled', 'Setup was stopped because no Gemini API key was provided.', ui.ButtonSet.OK);
+      return;
+    }
+    apiKey = response.getResponseText().trim();
+    if (!apiKey) {
+      ui.alert('Invalid API Key', 'The API key cannot be empty.', ui.ButtonSet.OK);
+      return;
+    }
+    props.setProperty(CONFIG.PROP_GEMINI_KEY, apiKey);
+  }
+
+  props.deleteProperty(CONFIG.PROP_ACTIVE_MODEL);
+  props.deleteProperty(CONFIG.PROP_MODELS_LIST);
+
+  let masterFolder, inboxFolder, needsReviewFolder;
+
+  const existingMasterId = props.getProperty(CONFIG.PROP_MASTER_FOLDER_ID);
+  if (existingMasterId && folderExists(existingMasterId)) {
+    masterFolder = DriveApp.getFolderById(existingMasterId);
+  } else {
+    masterFolder = DriveApp.createFolder(CONFIG.MASTER_FOLDER_NAME);
+    props.setProperty(CONFIG.PROP_MASTER_FOLDER_ID, masterFolder.getId());
+  }
+
+  try {
+    masterFolder.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  } catch (e) {
+    Logger.log('Master folder sharing notice: ' + e.toString());
+  }
+
+  const existingInboxId = props.getProperty(CONFIG.PROP_INBOX_FOLDER_ID);
+  if (existingInboxId && folderExists(existingInboxId)) {
+    inboxFolder = DriveApp.getFolderById(existingInboxId);
+  } else {
+    inboxFolder = getOrCreateSubFolder(masterFolder, CONFIG.INBOX_FOLDER_NAME);
+    props.setProperty(CONFIG.PROP_INBOX_FOLDER_ID, inboxFolder.getId());
+  }
+
+  const existingReviewId = props.getProperty(CONFIG.PROP_NEEDS_REVIEW_FOLDER_ID);
+  if (existingReviewId && folderExists(existingReviewId)) {
+    needsReviewFolder = DriveApp.getFolderById(existingReviewId);
+  } else {
+    needsReviewFolder = getOrCreateSubFolder(masterFolder, CONFIG.NEEDS_REVIEW_FOLDER_NAME);
+    props.setProperty(CONFIG.PROP_NEEDS_REVIEW_FOLDER_ID, needsReviewFolder.getId());
+  }
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  setupMasterDataSheet(ss);
+  setupMonthlySummarySheet(ss);
+
+  ui.alert('Setup Complete',
+    'System Setup Completed Successfully!\n\n' +
+    'Master Folder: "' + masterFolder.getName() + '"\n' +
+    'Inbox Folder: "' + inboxFolder.getName() + '"\n' +
+    'Needs Review Folder: "' + needsReviewFolder.getName() + '"\n\n' +
+    'How to use:\n' +
+    '1. Upload renewal notice PDFs into your INBOX folder.\n' +
+    '2. Click "RENEWAL AUTOMATION" > "Process Inbox".\n' +
+    '3. Open the Action Center sidebar or click WhatsApp/Gmail in each row.\n' +
+    '4. All PDFs are set to "Anyone with link can view" automatically.',
+    ui.ButtonSet.OK);
+}
+
+function folderExists(folderId) {
+  try {
+    return !DriveApp.getFolderById(folderId).isTrashed();
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Finds or creates a subfolder. Cached per execution so a batch of 10 PDFs landing in
+ * the same month folder costs ONE Drive lookup, not ten.
+ */
+function getOrCreateSubFolder(parentFolder, folderName) {
+  const cacheKey = parentFolder.getId() + '::' + folderName;
+  if (_FOLDER_CACHE[cacheKey]) return _FOLDER_CACHE[cacheKey];
+
+  const folders = parentFolder.getFoldersByName(folderName);
+  let folder;
+  let isNew = false;
+  if (folders.hasNext()) {
+    folder = folders.next();
+  } else {
+    folder = parentFolder.createFolder(folderName);
+    isNew = true;
+  }
+
+  if (isNew) {
+    try { folder.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW); } catch (e) {}
+  }
+
+  _FOLDER_CACHE[cacheKey] = folder;
+  return folder;
+}
+
+function promptSetApiKey() {
+  const ui = SpreadsheetApp.getUi();
+  const props = PropertiesService.getScriptProperties();
+  const current = props.getProperty(CONFIG.PROP_GEMINI_KEY);
+  const currentMasked = current ? (current.substring(0, 6) + '...' + current.substring(current.length - 4)) : 'None';
+
+  const response = ui.prompt(
+    'Update Gemini API Key',
+    'Current Key: ' + currentMasked + '\n\nEnter your Google Gemini API Key:',
+    ui.ButtonSet.OK_CANCEL
+  );
+
+  if (response.getSelectedButton() === ui.Button.OK) {
+    const newKey = response.getResponseText().trim();
+    if (newKey) {
+      props.setProperty(CONFIG.PROP_GEMINI_KEY, newKey);
+      props.deleteProperty(CONFIG.PROP_ACTIVE_MODEL);
+      props.deleteProperty(CONFIG.PROP_MODELS_LIST);
+      ui.alert('Key Saved', 'Gemini API Key updated and model cache cleared.', ui.ButtonSet.OK);
+    } else {
+      ui.alert('Invalid Key', 'API Key cannot be empty.', ui.ButtonSet.OK);
+    }
+  }
+}
+
+function showSystemInfo() {
+  const ui = SpreadsheetApp.getUi();
+  const props = PropertiesService.getScriptProperties();
+  const masterId = props.getProperty(CONFIG.PROP_MASTER_FOLDER_ID);
+  const inboxId = props.getProperty(CONFIG.PROP_INBOX_FOLDER_ID);
+  const reviewId = props.getProperty(CONFIG.PROP_NEEDS_REVIEW_FOLDER_ID);
+  const apiKey = props.getProperty(CONFIG.PROP_GEMINI_KEY);
+  const cachedModel = props.getProperty(CONFIG.PROP_ACTIVE_MODEL) ||
+    (CONFIG.GEMINI_MODEL + ' (preferred)');
+
+  if (!masterId || !inboxId || !reviewId) {
+    ui.alert('System Not Initialized', 'Please run "Setup / Initialize System" first.', ui.ButtonSet.OK);
+    return;
+  }
+
+  const masterFolder = DriveApp.getFolderById(masterId);
+  const inboxFolder = DriveApp.getFolderById(inboxId);
+  const reviewFolder = DriveApp.getFolderById(reviewId);
+
+  ui.alert('System Information',
+    'System Configuration Details:\n\n' +
+    '\u2022 Gemini API Key: ' + (apiKey ? 'Configured' : 'MISSING') + '\n' +
+    '\u2022 Active Gemini Model: ' + cachedModel + '\n\n' +
+    '\u2022 Master Folder: ' + masterFolder.getName() + '\n  ' + masterFolder.getUrl() + '\n\n' +
+    '\u2022 Inbox: ' + inboxFolder.getName() + '\n  ' + inboxFolder.getUrl() + '\n\n' +
+    '\u2022 Needs Review: ' + reviewFolder.getName() + '\n  ' + reviewFolder.getUrl(),
+    ui.ButtonSet.OK);
+}
+
+// ======================================================================================
+// 4. PARALLEL DRIVE ENGINE (REST + fetchAll, with DriveApp fallback)
+// ======================================================================================
+
+function getDriveToken() {
+  try { return ScriptApp.getOAuthToken(); } catch (e) { return null; }
+}
+
+/**
+ * Runs an array of UrlFetchApp request objects in parallel, chunked for safety.
+ */
+function safeFetchAll(requests, chunkSize) {
+  if (!requests || requests.length === 0) return [];
+  const size = chunkSize || 25;
+  let out = [];
+  for (let i = 0; i < requests.length; i += size) {
+    const slice = requests.slice(i, i + size);
+    try {
+      out = out.concat(UrlFetchApp.fetchAll(slice));
+    } catch (e) {
+      Logger.log('fetchAll fallback: ' + e.toString());
+      slice.forEach(function (r) {
+        try { out.push(UrlFetchApp.fetch(r.url, r)); } catch (e2) { out.push(null); }
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Downloads all PDF bytes in PARALLEL (was 10 sequential file.getBlob() calls).
+ */
+function fetchFileBlobsParallel(items) {
+  const token = getDriveToken();
+  if (token && items.length > 1) {
+    const reqs = items.map(function (it) {
+      return {
+        url: 'https://www.googleapis.com/drive/v3/files/' + it.fileId + '?alt=media&supportsAllDrives=true',
+        method: 'get',
+        headers: { Authorization: 'Bearer ' + token },
+        muteHttpExceptions: true
+      };
+    });
+    const res = safeFetchAll(reqs, 10);
+    for (let i = 0; i < items.length; i++) {
+      const r = res[i];
+      if (r) {
+        try { if (r.getResponseCode() === 200) items[i].blob = r.getBlob(); } catch (e) {}
+      }
+    }
+  }
+  items.forEach(function (it) {
+    if (!it.blob) {
+      try { it.blob = it.file.getBlob(); } catch (e) { it.blob = null; }
+    }
+  });
+}
+
+/**
+ * Applies rename + move + public sharing for a whole batch in ONE parallel round.
+ */
+function applyDriveBatch(ops) {
+  if (!ops || ops.length === 0) return;
+  const token = getDriveToken();
+
+  if (!token) {
+    ops.forEach(applySingleDriveOpFallback);
+    return;
+  }
+
+  const reqs = [];
+  const map = [];
+
+  ops.forEach(function (op) {
+    const willMove = op.addParentId && op.addParentId !== op.removeParentId;
+    if (op.newName || willMove) {
+      const params = ['supportsAllDrives=true', 'fields=id'];
+      if (willMove) {
+        params.push('addParents=' + op.addParentId);
+        if (op.removeParentId) params.push('removeParents=' + op.removeParentId);
+      }
+      const body = {};
+      if (op.newName) body.name = op.newName;
+      reqs.push({
+        url: 'https://www.googleapis.com/drive/v3/files/' + op.fileId + '?' + params.join('&'),
+        method: 'patch',
+        contentType: 'application/json',
+        headers: { Authorization: 'Bearer ' + token },
+        payload: JSON.stringify(body),
+        muteHttpExceptions: true
+      });
+      map.push({ op: op, kind: 'update' });
+    }
+
+    if (!_SHARE_CACHE[op.fileId]) {
+      reqs.push({
+        url: 'https://www.googleapis.com/drive/v3/files/' + op.fileId + '/permissions?supportsAllDrives=true&sendNotificationEmail=false&fields=id',
+        method: 'post',
+        contentType: 'application/json',
+        headers: { Authorization: 'Bearer ' + token },
+        payload: JSON.stringify({ role: 'reader', type: 'anyone' }),
+        muteHttpExceptions: true
+      });
+      map.push({ op: op, kind: 'share' });
+    }
+  });
+
+  if (reqs.length === 0) return;
+
+  const res = safeFetchAll(reqs, 25);
+
+  for (let i = 0; i < map.length; i++) {
+    const entry = map[i];
+    let code = 0;
+    try { code = res[i] ? res[i].getResponseCode() : 0; } catch (e) {}
+
+    if (code >= 200 && code < 300) {
+      if (entry.kind === 'share') _SHARE_CACHE[entry.op.fileId] = true;
+    } else {
+      entry.op._needsFallback = true;
+      Logger.log('Drive REST ' + entry.kind + ' returned ' + code + ' for ' + entry.op.fileId + ' - retrying via DriveApp.');
+    }
+  }
+
+  ops.filter(function (o) { return o._needsFallback; }).forEach(applySingleDriveOpFallback);
+}
+
+function applySingleDriveOpFallback(op) {
+  try {
+    const file = op.file || DriveApp.getFileById(op.fileId);
+    if (op.newName) { try { file.setName(op.newName); } catch (e) {} }
+    if (op.targetFolder && op.addParentId !== op.removeParentId) {
+      try { file.moveTo(op.targetFolder); } catch (e) {}
+    }
+    if (!_SHARE_CACHE[op.fileId]) {
+      try {
+        file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+        _SHARE_CACHE[op.fileId] = true;
+      } catch (e) {}
+    }
+  } catch (err) {
+    Logger.log('Drive fallback failed for ' + op.fileId + ': ' + err.message);
+  }
+}
+
+function bulkShareFileIds(fileIds) {
+  const pending = fileIds.filter(function (id) { return id && !_SHARE_CACHE[id]; });
+  if (pending.length === 0) return 0;
+
+  const token = getDriveToken();
+  let shared = 0;
+
+  if (token) {
+    const reqs = pending.map(function (id) {
+      return {
+        url: 'https://www.googleapis.com/drive/v3/files/' + id + '/permissions?supportsAllDrives=true&sendNotificationEmail=false&fields=id',
+        method: 'post',
+        contentType: 'application/json',
+        headers: { Authorization: 'Bearer ' + token },
+        payload: JSON.stringify({ role: 'reader', type: 'anyone' }),
+        muteHttpExceptions: true
+      };
+    });
+    const res = safeFetchAll(reqs, 25);
+    for (let i = 0; i < pending.length; i++) {
+      let code = 0;
+      try { code = res[i] ? res[i].getResponseCode() : 0; } catch (e) {}
+      if (code >= 200 && code < 300) { _SHARE_CACHE[pending[i]] = true; shared++; }
+    }
+  }
+
+  pending.forEach(function (id) {
+    if (!_SHARE_CACHE[id]) {
+      try {
+        DriveApp.getFileById(id).setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+        _SHARE_CACHE[id] = true;
+        shared++;
+      } catch (e) {}
+    }
+  });
+
+  return shared;
+}
+
+// ======================================================================================
+// 5. PDF TEXT EXTRACTION (WITH GARBAGE GUARD)
+// ======================================================================================
+
+/**
+ * Fast PDF text stream parser.
+ *
+ * CRITICAL FIX: many insurer PDFs use compressed / subset-embedded fonts. Scraping their
+ * raw streams produces thousands of characters of noise like "* Z< xSW 3 } } [ m ][C 1 5 J".
+ * The old code treated that as valid text and sent it to Gemini, which then returned
+ * nothing ("Extraction payload was empty"). We now score the result and reject it unless
+ * it genuinely looks like prose, in which case the full PDF is sent instead.
+ */
+function extractTextFromPdfBlob(blob) {
+  try {
+    if (!blob) return null;
+    const bytes = blob.getBytes();
+    if (!bytes || bytes.length === 0) return null;
+
+    const scanLen = Math.min(bytes.length, 900000);
+    const slice = (bytes.length > scanLen) ? bytes.slice(0, scanLen) : bytes;
+    const rawStr = Utilities.newBlob(slice).getDataAsString('ISO-8859-1');
+
+    const chunks = [];
+
+    // Pattern 1: literal text in parentheses, e.g. (Policyholder Name)
+    const matches1 = rawStr.match(/\(([^()]{2,160})\)/g);
+    if (matches1) {
+      for (let i = 0; i < matches1.length; i++) {
+        const clean = matches1[i].slice(1, -1)
+          .replace(/\\([0-7]{1,3})/g, function (m, oct) { return String.fromCharCode(parseInt(oct, 8)); })
+          .replace(/\\[rnbtf]/g, ' ')
+          .replace(/\\([()])/g, '$1')
+          .replace(/\\\\/g, '\\')
+          .replace(/[^\x20-\x7E]/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (clean.length > 1 && /[a-zA-Z0-9]/.test(clean)) chunks.push(clean);
+      }
+    }
+
+    // Pattern 2: hex-encoded text chunks, e.g. <416A6179>
+    if (chunks.length < 15) {
+      const matches2 = rawStr.match(/<([0-9A-Fa-f]{8,120})>/g);
+      if (matches2) {
+        for (let i = 0; i < matches2.length; i++) {
+          const hex = matches2[i].slice(1, -1);
+          let str = '';
+          for (let k = 0; k < hex.length - 1; k += 2) {
+            const code = parseInt(hex.substr(k, 2), 16);
+            if (code >= 32 && code <= 126) str += String.fromCharCode(code);
+          }
+          if (str.length > 2 && /[a-zA-Z0-9]/.test(str)) chunks.push(str);
+        }
+      }
+    }
+
+    if (chunks.length >= 8) {
+      const textClean = chunks.join(' ').replace(/\s+/g, ' ').trim();
+      const quality = scoreExtractedText(textClean);
+      if (quality.ok) return textClean.substring(0, 4500);
+      Logger.log('Text extraction rejected as stream noise (' + quality.why + ') - sending full PDF instead.');
+    }
+  } catch (e) {
+    Logger.log('Text extraction notice: ' + e.toString());
+  }
+  return null;
+}
+
+/**
+ * Decides whether scraped text is real document text or compressed-stream garbage.
+ */
+function scoreExtractedText(text) {
+  if (!text || text.length < 80) return { ok: false, why: 'too short' };
+
+  const words = text.match(/[A-Za-z]{4,}/g) || [];
+  const letters = (text.match(/[A-Za-z]/g) || []).length;
+  const letterRatio = letters / text.length;
+  const avgTokenLen = text.length / Math.max(1, (text.split(/\s+/).length));
+
+  if (words.length < 15) return { ok: false, why: 'only ' + words.length + ' real words' };
+  if (letterRatio < 0.45) return { ok: false, why: 'letter ratio ' + letterRatio.toFixed(2) };
+  if (avgTokenLen < 1.8) return { ok: false, why: 'fragmented tokens' };
+
+  return { ok: true, why: 'ok (' + words.length + ' words, ratio ' + letterRatio.toFixed(2) + ')' };
+}
+
+// ======================================================================================
+// 6. GEMINI REQUEST BUILDER
+// ======================================================================================
+
+/**
+ * Builds a Gemini request. Returns { req, mode, b64 }.
+ * Hot path always sends the PDF (forcePdf=true). Thinking is forced to the
+ * fastest setting for the model family. b64 is returned so retries reuse it.
+ */
+function thinkingConfigFor(model) {
+  const m = String(model || '');
+  if (m.indexOf('2.5') !== -1) return { thinkingBudget: 0 };
+  return { thinkingLevel: 'minimal' };
+}
+
+function listGeminiCandidates() {
+  const out = [];
+  const seen = {};
+  const raw = [CONFIG.GEMINI_MODEL].concat(CONFIG.GEMINI_FALLBACK_MODELS || []).concat(CONFIG.MODEL_PRIORITY || []);
+  raw.forEach(function (m) {
+    if (m && !seen[m]) { seen[m] = true; out.push(m); }
+  });
+  return out;
+}
+
+/**
+ * Picks the first Flash-Lite model this API key can actually call.
+ * gemini-2.5-flash-lite 404s for many new keys; 3.5-flash-lite is the replacement.
+ * Result is cached in Script Properties so later runs skip the probe.
+ */
+function resolveWorkingGeminiModel(apiKey) {
+  if (_ACTIVE_WORKING_MODEL) return _ACTIVE_WORKING_MODEL;
+
+  const props = PropertiesService.getScriptProperties();
+  const candidates = listGeminiCandidates();
+  const cached = props.getProperty(CONFIG.PROP_ACTIVE_MODEL);
+  if (cached && candidates.indexOf(cached) !== -1) {
+    _ACTIVE_WORKING_MODEL = cached;
+    return cached;
+  }
+
+  for (let i = 0; i < candidates.length; i++) {
+    const model = candidates[i];
+    const url = 'https://generativelanguage.googleapis.com/' + CONFIG.GEMINI_API_VERSION +
+                '/models/' + model + ':generateContent?key=' + apiKey;
+    try {
+      const res = UrlFetchApp.fetch(url, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: 'Reply with the single word CONNECTED.' }] }],
+          generationConfig: {
+            maxOutputTokens: 16,
+            thinkingConfig: thinkingConfigFor(model)
+          }
+        }),
+        muteHttpExceptions: true
+      });
+      if (res.getResponseCode() === 200) {
+        _ACTIVE_WORKING_MODEL = model;
+        try { props.setProperty(CONFIG.PROP_ACTIVE_MODEL, model); } catch (e) {}
+        Logger.log('Active Gemini model: ' + model);
+        return model;
+      }
+      Logger.log('Probe ' + model + ' -> HTTP ' + res.getResponseCode());
+    } catch (e) {
+      Logger.log('Probe ' + model + ' error: ' + e.message);
+    }
+  }
+
+  _ACTIVE_WORKING_MODEL = candidates[0];
+  return _ACTIVE_WORKING_MODEL;
+}
+
+function nextGeminiFallback(current) {
+  const candidates = listGeminiCandidates();
+  const idx = candidates.indexOf(current);
+  if (idx === -1) return candidates[1] || candidates[0];
+  return candidates[idx + 1] || '';
+}
+function buildGeminiRequest(blob, apiKey, model, forcePdf, cachedB64) {
+  let parts;
+  let mode = 'pdf';
+  let b64 = cachedB64 || '';
+
+  const digitalText = forcePdf ? null : extractTextFromPdfBlob(blob);
+
+  if (digitalText && digitalText.length > 80) {
+    mode = 'text';
+    parts = [{
+      text: 'Extract insurance renewal notice fields from this document text into JSON:\n' +
+            '--- DOCUMENT TEXT ---\n' + digitalText + '\n---------------------\n\n' +
+            'Return ONLY valid JSON matching this schema:\n' +
+            '{"clientName":"","renewalDate":"YYYY-MM-DD","insuranceCompany":"","policyNumber":"","clientMobile":"","clientEmail":""}'
+    }];
+  } else {
+    if (!b64) b64 = Utilities.base64Encode(blob.getBytes());
+    parts = [
+      {
+        text: 'Extract insurance renewal notice fields into JSON:\n' +
+              '- clientName: Policyholder full legal name\n' +
+              '- renewalDate: Due date strictly in YYYY-MM-DD format\n' +
+              '- insuranceCompany: Insurer company name\n' +
+              '- policyNumber: Policy number (or empty string)\n' +
+              '- clientMobile: Contact phone number (or empty string)\n' +
+              '- clientEmail: Contact email (or empty string)\n\n' +
+              'Return ONLY valid JSON matching:\n' +
+              '{"clientName":"","renewalDate":"","insuranceCompany":"","policyNumber":"","clientMobile":"","clientEmail":""}'
+      },
+      { inlineData: { mimeType: 'application/pdf', data: b64 } }
+    ];
+  }
+
+  const payload = {
+    contents: [{ role: 'user', parts: parts }],
+    generationConfig: {
+      maxOutputTokens: 1024,
+      responseMimeType: 'application/json',
+      thinkingConfig: thinkingConfigFor(model)
+    }
+  };
+
+  return {
+    mode: mode,
+    b64: b64,
+    req: {
+      url: 'https://generativelanguage.googleapis.com/' + CONFIG.GEMINI_API_VERSION +
+           '/models/' + model + ':generateContent?key=' + apiKey,
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    }
+  };
+}
+
+function prepareGeminiRequest(fileOrBlob, apiKey, model) {
+  const blob = (fileOrBlob && typeof fileOrBlob.getBlob === 'function') ? fileOrBlob.getBlob() : fileOrBlob;
+  return buildGeminiRequest(blob, apiKey, model, false).req;
+}
+
+/**
+ * Parses a Gemini HTTP response. Returns { data, httpCode, reason }.
+ */
+function parseGeminiResponse(resp) {
+  const result = { data: null, httpCode: 0, reason: '' };
+  if (!resp) { result.reason = 'no response'; return result; }
+
+  try {
+    result.httpCode = resp.getResponseCode();
+  } catch (e) {
+    result.reason = 'unreadable response';
+    return result;
+  }
+
+  if (result.httpCode === 503) { result.reason = 'model overloaded (HTTP 503)'; return result; }
+  if (result.httpCode === 429) { result.reason = 'rate limit hit (HTTP 429)'; return result; }
+  if (result.httpCode === 404) {
+    let extra = '';
+    try { extra = resp.getContentText(); } catch (e) {}
+    if (extra.indexOf('no longer available') !== -1) {
+      result.reason = 'model not available for this API key (HTTP 404)';
+    } else {
+      result.reason = 'model not found (HTTP 404)';
+    }
+    return result;
+  }
+  if (result.httpCode !== 200) { result.reason = 'HTTP ' + result.httpCode; return result; }
+
+  try {
+    const json = JSON.parse(resp.getContentText());
+    if (!json.candidates || json.candidates.length === 0) {
+      result.reason = 'no candidates returned';
+      return result;
+    }
+    const cand = json.candidates[0];
+    if (cand.finishReason === 'MAX_TOKENS') { result.reason = 'response truncated (MAX_TOKENS)'; return result; }
+    if (cand.finishReason === 'SAFETY') { result.reason = 'blocked by safety filter'; return result; }
+    if (!cand.content || !cand.content.parts || cand.content.parts.length === 0) {
+      result.reason = 'empty content block';
+      return result;
+    }
+
+    let str = '';
+    const partsOut = cand.content.parts;
+    for (let p = 0; p < partsOut.length; p++) {
+      if (partsOut[p].thought) continue;
+      if (partsOut[p].text) { str = String(partsOut[p].text).trim(); break; }
+    }
+    if (str.indexOf('```json') === 0) str = str.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+    else if (str.indexOf('```') === 0) str = str.replace(/^```\s*/, '').replace(/\s*```$/, '');
+
+    const parsed = JSON.parse(str);
+    if (parsed && parsed.renewalDate) parsed.renewalDate = normalizeDateToYYYYMMDD(parsed.renewalDate);
+    result.data = parsed;
+  } catch (e) {
+    result.reason = 'could not parse reply: ' + e.message;
+  }
+  return result;
+}
+
+/** True when a second same-model call is worth the extra seconds. */
+function isTransientGeminiFailure(reason) {
+  if (!reason) return false;
+  const r = String(reason);
+  return r.indexOf('503') !== -1 ||
+         r.indexOf('429') !== -1 ||
+         r.indexOf('empty content') !== -1 ||
+         r.indexOf('no candidates') !== -1 ||
+         r.indexOf('no response') !== -1 ||
+         r.indexOf('unreadable') !== -1 ||
+         r.indexOf('HTTP 5') !== -1 ||
+         r.indexOf('could not parse') !== -1;
+}
+
+// ======================================================================================
+// 7. HIGH-SPEED BATCH ENGINE
+// ======================================================================================
+
+function processBatchConcurrent(filesToProcess, masterFolder, reviewFolder, masterSheet, existingRecords, apiKey, isNeedsReviewMode, sourceFolderId) {
+  const startTime = Date.now();
+
+  const stats = {
+    totalFound: filesToProcess ? filesToProcess.length : 0,
+    processed: 0, success: 0, needsReview: 0, skipped: 0, remaining: 0,
+    overloaded: 0, elapsedSeconds: '0.0', fileDetails: []
+  };
+
+  if (!filesToProcess || filesToProcess.length === 0) return stats;
+
+  const model = resolveWorkingGeminiModel(apiKey);
+
+  // ---- Step 1: filter duplicates ---------------------------------------------------
+  const items = [];
+  for (let i = 0; i < filesToProcess.length; i++) {
+    const file = filesToProcess[i];
+    const fileId = file.getId();
+
+    if (!isNeedsReviewMode && existingRecords.has(fileId)) {
+      if (existingRecords.get(fileId).status === 'SUCCESS') { stats.skipped++; continue; }
+    }
+
+    items.push({
+      file: file, fileId: fileId, originalName: file.getName(),
+      globalIndex: i + 1, blob: null, b64: '', mode: 'pdf', extraction: null, reason: ''
+    });
+  }
+
+  if (items.length === 0) {
+    stats.elapsedSeconds = ((Date.now() - startTime) / 1000).toFixed(1);
+    return stats;
+  }
+  stats.processed = items.length;
+
+  Logger.log('Batch start: ' + items.length + ' files | model: ' + model);
+
+  // ---- Step 2: parallel download ---------------------------------------------------
+  let t = Date.now();
+  fetchFileBlobsParallel(items);
+  Logger.log('Parallel download: ' + ((Date.now() - t) / 1000).toFixed(2) + 's');
+
+  // ---- Step 3: ONE parallel Gemini round (PDF, thinking off) -----------------------
+  t = Date.now();
+  const requests = [];
+  const active = [];
+  items.forEach(function (it) {
+    if (!it.blob) { it.reason = 'PDF content could not be read from Drive'; return; }
+    const built = buildGeminiRequest(it.blob, apiKey, model, true);
+    it.mode = built.mode;
+    it.b64 = built.b64;
+    requests.push(built.req);
+    active.push(it);
+  });
+
+  const responses = safeFetchAll(requests, CONFIG.CONCURRENCY);
+  for (let i = 0; i < active.length; i++) {
+    const r = parseGeminiResponse(responses[i]);
+    active[i].extraction = r.data;
+    if (!r.data) active[i].reason = r.reason;
+  }
+  Logger.log('Parallel Gemini round: ' + ((Date.now() - t) / 1000).toFixed(2) + 's');
+
+  // If the preferred model 404'd (common for gemini-2.5-flash-lite on new keys),
+  // swap to the next Flash-Lite and rerun the same encoded PDFs immediately.
+  let usedModel = model;
+  if (active.length > 0) {
+    const allBadModel = active.every(function (it) {
+      return it.reason && (it.reason.indexOf('404') !== -1 || it.reason.indexOf('400') !== -1);
+    });
+    const fallback = allBadModel ? nextGeminiFallback(usedModel) : '';
+    if (fallback) {
+      Logger.log(usedModel + ' rejected the request — switching to ' + fallback);
+      usedModel = fallback;
+      _ACTIVE_WORKING_MODEL = fallback;
+      try { PropertiesService.getScriptProperties().setProperty(CONFIG.PROP_ACTIVE_MODEL, fallback); } catch (e) {}
+
+      t = Date.now();
+      const swapReqs = active.map(function (it) {
+        return buildGeminiRequest(it.blob, apiKey, usedModel, true, it.b64).req;
+      });
+      const swapRes = safeFetchAll(swapReqs, CONFIG.CONCURRENCY);
+      for (let i = 0; i < active.length; i++) {
+        const r = parseGeminiResponse(swapRes[i]);
+        active[i].extraction = r.data;
+        active[i].reason = r.data ? '' : r.reason;
+      }
+      Logger.log('Fallback Gemini round (' + usedModel + '): ' + ((Date.now() - t) / 1000).toFixed(2) + 's');
+    }
+  }
+
+  // ---- Step 4: retry ONLY transient failures (same working model, reuse encoded PDF) -------
+  if (Date.now() - startTime < CONFIG.MAX_RUNTIME_MS) {
+    const retryItems = [];
+    active.forEach(function (it) {
+      if (validateExtraction(it.extraction).isValid) return;
+      if (isTransientGeminiFailure(it.reason)) retryItems.push(it);
+    });
+
+    if (retryItems.length > 0) {
+      const needPause = retryItems.some(function (it) {
+        return it.reason && (it.reason.indexOf('503') !== -1 || it.reason.indexOf('429') !== -1);
+      });
+      Logger.log('Retrying ' + retryItems.length + ' transient failure(s) on ' + usedModel);
+      if (needPause) Utilities.sleep(CONFIG.RETRY_PAUSE_MS);
+
+      const retryReqs = retryItems.map(function (it) {
+        return buildGeminiRequest(it.blob, apiKey, usedModel, true, it.b64).req;
+      });
+      const retryRes = safeFetchAll(retryReqs, CONFIG.CONCURRENCY);
+
+      for (let i = 0; i < retryItems.length; i++) {
+        const r = parseGeminiResponse(retryRes[i]);
+        if (r.data && validateExtraction(r.data).isValid) {
+          retryItems[i].extraction = r.data;
+          retryItems[i].reason = '';
+        } else {
+          if (!retryItems[i].extraction && r.data) retryItems[i].extraction = r.data;
+          if (r.reason) retryItems[i].reason = r.reason;
+        }
+      }
+    }
+  }
+
+  items.forEach(function (it) { it.blob = null; it.b64 = ''; });
+
+  // ---- Step 5: parallel rename + move + share --------------------------------------
+  const driveOps = [];
+  items.forEach(function (it) {
+    const validation = validateExtraction(it.extraction);
+    it.valid = validation.isValid;
+    if (!it.valid && !it.reason) it.reason = validation.reason;
+    if (!it.valid && it.reason && it.reason.indexOf('503') !== -1) stats.overloaded++;
+
+    if (it.valid) {
+      const renewalDate = it.extraction.renewalDate;
+      it.monthYear = formatMonthYear(renewalDate);
+      it.targetFolder = getOrCreateSubFolder(masterFolder, it.monthYear);
+      it.newName = renewalDate + '-' + cleanClientNameForFilename(it.extraction.clientName) +
+                   '-' + cleanCompanyName(it.extraction.insuranceCompany) + '.pdf';
+    } else {
+      it.monthYear = (it.extraction && it.extraction.renewalDate) ? formatMonthYear(it.extraction.renewalDate) : 'UNKNOWN';
+      it.targetFolder = reviewFolder;
+      it.newName = null;
+    }
+
+    driveOps.push({
+      fileId: it.fileId, file: it.file, newName: it.newName, targetFolder: it.targetFolder,
+      addParentId: it.targetFolder.getId(), removeParentId: sourceFolderId || null
+    });
+  });
+
+  t = Date.now();
+  applyDriveBatch(driveOps);
+  Logger.log('Parallel Drive ops: ' + ((Date.now() - t) / 1000).toFixed(2) + 's');
+
+  // ---- Step 6: bulk sheet write ----------------------------------------------------
+  const timestamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+  let nextSrNo = getNextSerialNumber(masterSheet);
+
+  const appendRows = [];
+  const updateRows = [];
+
+  items.forEach(function (it) {
+    const existingRowMeta = existingRecords.get(it.fileId);
+    const fileUrl = buildDriveViewUrl(it.fileId);
+    const folderUrl = it.targetFolder.getUrl();
+    const ext = it.extraction || {};
+
+    let rowData;
+    if (it.valid) {
+      rowData = {
+        srNo: existingRowMeta ? existingRowMeta.srNo : nextSrNo++,
+        clientName: ext.clientName, renewalDate: ext.renewalDate, month: it.monthYear,
+        company: ext.insuranceCompany, policyNumber: ext.policyNumber || '',
+        clientMobile: ext.clientMobile || '', clientEmail: ext.clientEmail || '',
+        whatsappUrl: generateWhatsAppLink(ext.clientMobile, ext.clientName, ext.insuranceCompany, ext.renewalDate, fileUrl, ext.policyNumber),
+        gmailUrl: generateGmailComposeLink(ext.clientEmail, ext.clientName, ext.insuranceCompany, ext.renewalDate, fileUrl, ext.policyNumber),
+        fileName: it.newName, fileUrl: fileUrl, folderName: it.monthYear, folderUrl: folderUrl,
+        status: 'SUCCESS', dateProcessed: timestamp,
+        originalName: (isNeedsReviewMode && existingRowMeta) ? existingRowMeta.originalName : it.originalName,
+        fileId: it.fileId, notes: isNeedsReviewMode ? 'Resolved via Needs Review reprocessing' : ''
+      };
+      stats.success++;
+      stats.fileDetails.push({ name: it.originalName, status: 'SUCCESS', client: ext.clientName, date: ext.renewalDate });
+    } else {
+      rowData = {
+        srNo: existingRowMeta ? existingRowMeta.srNo : nextSrNo++,
+        clientName: ext.clientName || 'UNKNOWN', renewalDate: ext.renewalDate || '', month: it.monthYear,
+        company: ext.insuranceCompany || 'UNKNOWN', policyNumber: ext.policyNumber || '',
+        clientMobile: ext.clientMobile || '', clientEmail: ext.clientEmail || '',
+        whatsappUrl: '', gmailUrl: '',
+        fileName: it.originalName, fileUrl: fileUrl,
+        folderName: CONFIG.NEEDS_REVIEW_FOLDER_NAME, folderUrl: folderUrl,
+        status: 'NEEDS REVIEW', dateProcessed: timestamp,
+        originalName: (isNeedsReviewMode && existingRowMeta) ? existingRowMeta.originalName : it.originalName,
+        fileId: it.fileId, notes: it.reason || 'Validation failed'
+      };
+      stats.needsReview++;
+      stats.fileDetails.push({ name: it.originalName, status: 'NEEDS REVIEW', reason: it.reason });
+    }
+
+    const values = buildMasterRowValues(rowData);
+    if (existingRowMeta && existingRowMeta.rowIndex) {
+      updateRows.push({ rowIndex: existingRowMeta.rowIndex, values: values, status: rowData.status });
+    } else {
+      appendRows.push({ values: values, status: rowData.status });
+    }
+  });
+
+  t = Date.now();
+  flushMasterRows(masterSheet, appendRows, updateRows);
+  Logger.log('Bulk sheet write: ' + ((Date.now() - t) / 1000).toFixed(2) + 's');
+
+  refreshMonthlySummary();
+
+  stats.elapsedSeconds = ((Date.now() - startTime) / 1000).toFixed(1);
+  Logger.log('Batch complete in ' + stats.elapsedSeconds + 's - Success: ' + stats.success +
+             ', Needs Review: ' + stats.needsReview + ', Skipped: ' + stats.skipped);
+  return stats;
+}
+
+function processInbox() {
+  const props = PropertiesService.getScriptProperties();
+  const inboxId = props.getProperty(CONFIG.PROP_INBOX_FOLDER_ID);
+  const masterId = props.getProperty(CONFIG.PROP_MASTER_FOLDER_ID);
+  const reviewId = props.getProperty(CONFIG.PROP_NEEDS_REVIEW_FOLDER_ID);
+  const apiKey = props.getProperty(CONFIG.PROP_GEMINI_KEY);
+
+  if (!inboxId || !masterId || !reviewId) {
+    throw new Error('System is not initialized. Please run "Setup / Initialize System" first.');
+  }
+  if (!apiKey) {
+    throw new Error('Gemini API Key is missing. Please set it using "Set / Update Gemini API Key".');
+  }
+
+  const inboxFolder = DriveApp.getFolderById(inboxId);
+  const masterFolder = DriveApp.getFolderById(masterId);
+  const reviewFolder = DriveApp.getFolderById(reviewId);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const masterSheet = ss.getSheetByName(CONFIG.SHEET_MASTER_DATA) || setupMasterDataSheet(ss);
+  ensureMasterDataSchema(masterSheet);
+  const existingRecords = getExistingFileMap(masterSheet);
+
+  const filesIter = inboxFolder.getFiles();
+  const pdfFiles = [];
+  while (filesIter.hasNext()) {
+    const file = filesIter.next();
+    if (file.getMimeType() === MimeType.PDF || file.getName().toLowerCase().indexOf('.pdf') !== -1) {
+      pdfFiles.push(file);
+    }
+  }
+
+  const filesToProcess = pdfFiles.slice(0, CONFIG.MAX_FILES_PER_RUN);
+  const stats = processBatchConcurrent(filesToProcess, masterFolder, reviewFolder, masterSheet, existingRecords, apiKey, false, inboxId);
+  stats.totalFound = pdfFiles.length;
+  stats.remaining = Math.max(0, pdfFiles.length - filesToProcess.length);
+  return stats;
+}
+
+function processNeedsReview() {
+  const props = PropertiesService.getScriptProperties();
+  const masterId = props.getProperty(CONFIG.PROP_MASTER_FOLDER_ID);
+  const reviewId = props.getProperty(CONFIG.PROP_NEEDS_REVIEW_FOLDER_ID);
+  const apiKey = props.getProperty(CONFIG.PROP_GEMINI_KEY);
+
+  if (!masterId || !reviewId) {
+    throw new Error('System is not initialized. Please run "Setup / Initialize System" first.');
+  }
+  if (!apiKey) {
+    throw new Error('Gemini API Key is missing. Please set it using "Set / Update Gemini API Key".');
+  }
+
+  const masterFolder = DriveApp.getFolderById(masterId);
+  const reviewFolder = DriveApp.getFolderById(reviewId);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const masterSheet = ss.getSheetByName(CONFIG.SHEET_MASTER_DATA) || setupMasterDataSheet(ss);
+  ensureMasterDataSchema(masterSheet);
+  const existingRecords = getExistingFileMap(masterSheet);
+
+  const filesIter = reviewFolder.getFiles();
+  const pdfFiles = [];
+  while (filesIter.hasNext()) {
+    const file = filesIter.next();
+    if (file.getMimeType() === MimeType.PDF || file.getName().toLowerCase().indexOf('.pdf') !== -1) {
+      pdfFiles.push(file);
+    }
+  }
+
+  const filesToProcess = pdfFiles.slice(0, CONFIG.MAX_FILES_PER_RUN);
+  const stats = processBatchConcurrent(filesToProcess, masterFolder, reviewFolder, masterSheet, existingRecords, apiKey, true, reviewId);
+  stats.totalFound = pdfFiles.length;
+  stats.remaining = Math.max(0, pdfFiles.length - filesToProcess.length);
+  stats.stillNeedsReview = stats.needsReview;
+  return stats;
+}
+
+// ======================================================================================
+// 8. SHARING & URL UTILITIES
+// ======================================================================================
+
+function extractDriveFileId(input) {
+  if (!input) return '';
+  const str = String(input).trim();
+  if (/^[a-zA-Z0-9_-]{25,}$/.test(str) && str.indexOf('http') === -1 && str.indexOf('/') === -1 && str.indexOf('"') === -1) {
+    return str;
+  }
+  const match = str.match(/\/d\/([a-zA-Z0-9_-]{25,})/i) || str.match(/[?&]id=([a-zA-Z0-9_-]{25,})/i);
+  return match ? match[1] : '';
+}
+
+/** Pure string builder - zero API calls. */
+function buildDriveViewUrl(fileId) {
+  return fileId ? ('https://drive.google.com/file/d/' + fileId + '/view?usp=sharing') : '';
+}
+
+/**
+ * Returns the public sharing URL for a file.
+ * PERFORMANCE: no longer makes a Drive API call on every invocation. Permissions are
+ * granted once per file during processing, or via the bulk-share menu item.
+ */
+function getPublicShareUrl(fileOrId) {
+  if (!fileOrId) return '';
+  try {
+    if (typeof fileOrId === 'string') {
+      const id = extractDriveFileId(fileOrId);
+      if (id) return buildDriveViewUrl(id);
+      return (fileOrId.indexOf('http') === 0) ? fileOrId : '';
+    }
+    return buildDriveViewUrl(fileOrId.getId());
+  } catch (err) {
+    return '';
+  }
+}
+
+// ======================================================================================
+// 9. 1-CLICK WHATSAPP & GMAIL COMPOSE ENGINE
+// ======================================================================================
+
+function generateWhatsAppLink(phone, clientName, company, renewalDate, fileUrl, policyNumber) {
+  let cleanPhone = String(phone || '').replace(/[^0-9]/g, '');
+  if (cleanPhone.indexOf('0') === 0 && cleanPhone.length === 11) {
+    cleanPhone = '91' + cleanPhone.substring(1);
+  } else if (cleanPhone.length === 10) {
+    cleanPhone = '91' + cleanPhone;
+  }
+
+  const policyText = policyNumber ? (' (Policy No: ' + policyNumber + ')') : '';
+  const cleanFileUrl = getPublicShareUrl(fileUrl);
+
+  const msg =
+    'Dear ' + (clientName || 'Valued Customer') + ',\n\n' +
+    'This is a gentle reminder that your ' + (company || 'Insurance') + ' policy' + policyText +
+    ' is due for renewal on *' + renewalDate + '*.\n\n' +
+    'Kindly renew your policy on time to enjoy uninterrupted coverage, continuous claim benefits, and bonus protections.\n\n' +
+    (cleanFileUrl ? ('\uD83D\uDCC4 View Renewal Notice: ' + cleanFileUrl + '\n\n') : '') +
+    'Please reach out to me if you need any assistance with the payment link or policy updates.\n\n' +
+    'Best Regards,\n' +
+    '*' + CONFIG.SENDER_NAME + '*\n' +
+    '\uD83C\uDF10 ' + CONFIG.SENDER_WEBSITE + '\n' +
+    '\uD83D\uDCDE ' + CONFIG.SENDER_PHONE;
+
+  const encoded = encodeURIComponent(msg);
+  if (cleanPhone && cleanPhone.length >= 10) {
+    return 'https://api.whatsapp.com/send?phone=' + cleanPhone + '&text=' + encoded;
+  }
+  return 'https://api.whatsapp.com/send?text=' + encoded;
+}
+
+function generateGmailComposeLink(email, clientName, company, renewalDate, fileUrl, policyNumber) {
+  const cleanEmail = String(email || '').trim();
+  const policyText = policyNumber ? (' (Policy No: ' + policyNumber + ')') : '';
+  const cleanFileUrl = getPublicShareUrl(fileUrl);
+
+  const subject = 'Policy Renewal Reminder: Your ' + (company || 'Insurance') + ' Policy is due on ' + renewalDate;
+
+  const body =
+    'Dear ' + (clientName || 'Valued Customer') + ',\n\n' +
+    'This is a gentle reminder that your ' + (company || 'Insurance') + ' policy' + policyText +
+    ' is due for renewal on ' + renewalDate + '.\n\n' +
+    'Kindly renew your policy on time to ensure continuous healthcare coverage, no-claim bonus protection, and seamless benefits.\n\n' +
+    (cleanFileUrl ? ('View Renewal Notice PDF: ' + cleanFileUrl + '\n\n') : '') +
+    'Please feel free to reach out to me if you need any assistance with the payment link or policy updates.\n\n' +
+    'Best Regards,\n' + CONFIG.SENDER_NAME + '\n' + CONFIG.SENDER_WEBSITE + '\n' +
+    'Phone: ' + CONFIG.SENDER_PHONE;
+
+  return 'https://mail.google.com/mail/?view=cm&fs=1&to=' + encodeURIComponent(cleanEmail) +
+         '&su=' + encodeURIComponent(subject) + '&body=' + encodeURIComponent(body);
+}
+
+function sendWhatsAppSelectedRow() {
+  const ui = SpreadsheetApp.getUi();
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+
+  if (sheet.getName() !== CONFIG.SHEET_MASTER_DATA) {
+    ui.alert('Wrong Sheet', 'Please switch to the "Master Data" sheet tab and select a client row.', ui.ButtonSet.OK);
+    return;
+  }
+  ensureMasterDataSchema(sheet);
+
+  const row = sheet.getActiveRange().getRow();
+  if (row <= 1) {
+    ui.alert('Selection Required', 'Please click on any client row in "Master Data" first.', ui.ButtonSet.OK);
+    return;
+  }
+
+  const rowData = sheet.getRange(row, 1, 1, CONFIG.COLS.NOTES).getValues()[0];
+  const clientName = String(rowData[CONFIG.COLS.CLIENT_NAME - 1] || '');
+  const renewalDate = String(rowData[CONFIG.COLS.RENEWAL_DATE - 1] || '');
+  const company = String(rowData[CONFIG.COLS.COMPANY - 1] || '');
+  const policyNo = String(rowData[CONFIG.COLS.POLICY_NO - 1] || '');
+  let mobile = String(rowData[CONFIG.COLS.CLIENT_MOBILE - 1] || '').trim();
+
+  let fileFormula = '';
+  try { fileFormula = sheet.getRange(row, CONFIG.COLS.FILE_LINK).getFormula(); } catch (e) {}
+  const fileId = extractDriveFileId(String(rowData[CONFIG.COLS.FILE_ID - 1] || '').trim()) || extractDriveFileId(fileFormula);
+  const fileUrl = buildDriveViewUrl(fileId);
+
+  if (!mobile) {
+    const promptRes = ui.prompt('Enter Mobile Number',
+      'No mobile number found for ' + (clientName || 'this client') + '.\nEnter 10-digit mobile number:',
+      ui.ButtonSet.OK_CANCEL);
+    if (promptRes.getSelectedButton() === ui.Button.OK) {
+      mobile = promptRes.getResponseText().trim();
+      if (mobile) sheet.getRange(row, CONFIG.COLS.CLIENT_MOBILE).setValue(mobile);
+    }
+  }
+
+  const whatsappUrl = generateWhatsAppLink(mobile, clientName, company, renewalDate, fileUrl, policyNo);
+
+  try {
+    const htmlOutput = HtmlService.createHtmlOutput(
+      '<div style="font-family: Arial, sans-serif; padding: 15px; text-align: center;">' +
+      '<h3 style="color: #0F5132;">\uD83D\uDCAC Send WhatsApp Reminder</h3>' +
+      '<p style="margin: 10px 0; font-size: 13px;"><b>Client:</b> ' + clientName +
+      '<br><b>Renewal Date:</b> ' + renewalDate + '<br><b>Company:</b> ' + company +
+      '<br><b>Mobile:</b> ' + (mobile || 'Select in WhatsApp') + '</p>' +
+      '<a href="' + whatsappUrl + '" target="_blank" style="display: inline-block; background-color: #25D366; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; font-size: 14px; margin-top: 8px;">\uD83D\uDC49 Click to Open WhatsApp Chat</a>' +
+      '<br><br><p style="font-size: 11px; color: #666;">(PDF link has direct viewing access enabled)</p></div>'
+    ).setWidth(420).setHeight(270);
+    ui.showModalDialog(htmlOutput, 'WhatsApp Reminder');
+  } catch (e) {
+    showRenewalSidebar();
+  }
+}
+
+function sendEmailReminderSelectedRow() {
+  const ui = SpreadsheetApp.getUi();
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+
+  if (sheet.getName() !== CONFIG.SHEET_MASTER_DATA) {
+    ui.alert('Wrong Sheet', 'Please switch to the "Master Data" sheet tab and select a client row.', ui.ButtonSet.OK);
+    return;
+  }
+  ensureMasterDataSchema(sheet);
+
+  const row = sheet.getActiveRange().getRow();
+  if (row <= 1) {
+    ui.alert('Selection Required', 'Please select a client row in "Master Data".', ui.ButtonSet.OK);
+    return;
+  }
+
+  const rowData = sheet.getRange(row, 1, 1, CONFIG.COLS.NOTES).getValues()[0];
+  const clientName = String(rowData[CONFIG.COLS.CLIENT_NAME - 1] || '');
+  const renewalDate = String(rowData[CONFIG.COLS.RENEWAL_DATE - 1] || '');
+  const company = String(rowData[CONFIG.COLS.COMPANY - 1] || '');
+  const policyNo = String(rowData[CONFIG.COLS.POLICY_NO - 1] || '');
+  let clientEmail = String(rowData[CONFIG.COLS.CLIENT_EMAIL - 1] || '').trim();
+
+  let fileFormula = '';
+  try { fileFormula = sheet.getRange(row, CONFIG.COLS.FILE_LINK).getFormula(); } catch (e) {}
+  const fileId = extractDriveFileId(String(rowData[CONFIG.COLS.FILE_ID - 1] || '').trim()) || extractDriveFileId(fileFormula);
+  const fileUrl = buildDriveViewUrl(fileId);
+
+  if (!clientEmail) {
+    const promptRes = ui.prompt('Enter Client Email',
+      'No email found for ' + (clientName || 'this client') + '.\nEnter email address:',
+      ui.ButtonSet.OK_CANCEL);
+    if (promptRes.getSelectedButton() === ui.Button.OK) {
+      clientEmail = promptRes.getResponseText().trim();
+      if (clientEmail) sheet.getRange(row, CONFIG.COLS.CLIENT_EMAIL).setValue(clientEmail);
+    }
+  }
+
+  const gmailUrl = generateGmailComposeLink(clientEmail, clientName, company, renewalDate, fileUrl, policyNo);
+
+  try {
+    const htmlOutput = HtmlService.createHtmlOutput(
+      '<div style="font-family: Arial, sans-serif; padding: 15px; text-align: center;">' +
+      '<h3 style="color: #1E3A8A;">\uD83D\uDCE7 Send Gmail Renewal Notice</h3>' +
+      '<p style="margin: 10px 0; font-size: 13px;"><b>Client:</b> ' + clientName +
+      '<br><b>Renewal Date:</b> ' + renewalDate + '<br><b>Company:</b> ' + company +
+      '<br><b>Email:</b> ' + (clientEmail || 'Enter in Gmail') + '</p>' +
+      '<a href="' + gmailUrl + '" target="_blank" style="display: inline-block; background-color: #2563EB; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; font-size: 14px; margin-top: 8px;">\uD83D\uDC49 Click to Open in Gmail Compose</a>' +
+      '<br><br><p style="font-size: 11px; color: #666;">(Opens Gmail Compose with notice & signature pre-filled)</p></div>'
+    ).setWidth(420).setHeight(270);
+    ui.showModalDialog(htmlOutput, 'Gmail Compose Reminder');
+  } catch (e) {
+    showRenewalSidebar();
+  }
+}
+
+function collectFolderFileIds(folder, idSet) {
+  const files = folder.getFiles();
+  while (files.hasNext()) idSet.add(files.next().getId());
+  const subfolders = folder.getFolders();
+  while (subfolders.hasNext()) collectFolderFileIds(subfolders.next(), idSet);
+}
+
+/**
+ * One-click bulk share. Permission grants run in parallel; the sheet is written in
+ * bulk column ranges instead of 3 setFormula calls per row.
+ */
+function makeAllFilesPubliclyViewable() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(CONFIG.SHEET_MASTER_DATA);
+  const props = PropertiesService.getScriptProperties();
+  const masterId = props.getProperty(CONFIG.PROP_MASTER_FOLDER_ID);
+
+  const allIds = new Set();
+  let sheetCount = 0;
+
+  if (sheet) {
+    const lastRow = sheet.getLastRow();
+    if (lastRow > 1) {
+      const numRows = lastRow - 1;
+      const data = sheet.getRange(2, 1, numRows, CONFIG.COLS.NOTES).getValues();
+      const formulas = sheet.getRange(2, 1, numRows, CONFIG.COLS.NOTES).getFormulas();
+
+      const actionCols = [];
+      const fileLinkCol = [];
+
+      for (let i = 0; i < numRows; i++) {
+        const row = data[i];
+        const fileFormula = String(formulas[i][CONFIG.COLS.FILE_LINK - 1] || '');
+        const fileId = extractDriveFileId(String(row[CONFIG.COLS.FILE_ID - 1] || '').trim()) || extractDriveFileId(fileFormula);
+
+        if (!fileId) {
+          actionCols.push([
+            formulas[i][CONFIG.COLS.WHATSAPP_LINK - 1] || String(row[CONFIG.COLS.WHATSAPP_LINK - 1] || '\u2014'),
+            formulas[i][CONFIG.COLS.EMAIL_ACTION - 1] || String(row[CONFIG.COLS.EMAIL_ACTION - 1] || '\u2014')
+          ]);
+          fileLinkCol.push([fileFormula || String(row[CONFIG.COLS.FILE_LINK - 1] || '')]);
+          continue;
+        }
+
+        allIds.add(fileId);
+        sheetCount++;
+
+        const publicUrl = buildDriveViewUrl(fileId);
+        const waUrl = generateWhatsAppLink(
+          String(row[CONFIG.COLS.CLIENT_MOBILE - 1] || ''), String(row[CONFIG.COLS.CLIENT_NAME - 1] || ''),
+          String(row[CONFIG.COLS.COMPANY - 1] || ''), String(row[CONFIG.COLS.RENEWAL_DATE - 1] || ''),
+          publicUrl, String(row[CONFIG.COLS.POLICY_NO - 1] || ''));
+        const gmUrl = generateGmailComposeLink(
+          String(row[CONFIG.COLS.CLIENT_EMAIL - 1] || ''), String(row[CONFIG.COLS.CLIENT_NAME - 1] || ''),
+          String(row[CONFIG.COLS.COMPANY - 1] || ''), String(row[CONFIG.COLS.RENEWAL_DATE - 1] || ''),
+          publicUrl, String(row[CONFIG.COLS.POLICY_NO - 1] || ''));
+
+        actionCols.push([
+          '=HYPERLINK("' + waUrl + '", "\uD83D\uDCAC Send WhatsApp")',
+          '=HYPERLINK("' + gmUrl + '", "\uD83D\uDCE7 Send Gmail")'
+        ]);
+        fileLinkCol.push(['=HYPERLINK("' + publicUrl + '", "\uD83D\uDCC4 Open PDF")']);
+      }
+
+      sheet.getRange(2, CONFIG.COLS.WHATSAPP_LINK, numRows, 2).setValues(actionCols);
+      sheet.getRange(2, CONFIG.COLS.FILE_LINK, numRows, 1).setValues(fileLinkCol);
+    }
+  }
+
+  if (masterId && folderExists(masterId)) {
+    try { collectFolderFileIds(DriveApp.getFolderById(masterId), allIds); }
+    catch (e) { Logger.log('Drive folder recursion error: ' + e.message); }
+  }
+
+  const idArray = Array.from(allIds);
+  bulkShareFileIds(idArray);
+
+  ui.alert('Sharing Permissions Updated',
+    'Direct Viewing Rights Enabled!\n\n' +
+    '\u2022 Total Renewal Notices Unlocked: ' + idArray.length + '\n' +
+    '\u2022 Master Sheet Links Updated: ' + sheetCount + '\n\n' +
+    'Clients opening notice links will now view the PDF directly without a "Request Access" screen.',
+    ui.ButtonSet.OK);
+}
+
+function testDrivePublicSharingStatus() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const testFile = DriveApp.createFile('_Sharing_Test_Temp.txt', 'Sharing Test');
+    testFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    const sharingAccess = testFile.getSharingAccess();
+    testFile.setTrashed(true);
+
+    ui.alert('Public Sharing Test: PASSED',
+      'Your Google account is configured correctly.\n\n' +
+      '\u2022 Public Sharing: ENABLED\n' +
+      '\u2022 Sharing Access Level: ' + sharingAccess + '\n\n' +
+      'Recipients can view shared PDF links without logging in.',
+      ui.ButtonSet.OK);
+  } catch (err) {
+    ui.alert('Public Sharing Restricted',
+      'Your Google Workspace domain restricts external sharing:\n\n' +
+      'Details: ' + err.message + '\n\n' +
+      'Ask your Google Admin to enable "Sharing outside of organization".',
+      ui.ButtonSet.OK);
+  }
+}
+
+// ======================================================================================
+// 10. INTERACTIVE ACTION CENTER SIDEBAR
+// ======================================================================================
+
+function showRenewalSidebar() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (ss) {
+    const sheet = ss.getActiveSheet();
+    if (sheet && sheet.getName() === CONFIG.SHEET_MASTER_DATA) ensureMasterDataSchema(sheet);
+  }
+  const html = HtmlService.createHtmlOutput(getSidebarHtml())
+    .setTitle('Renewal Action Center')
+    .setWidth(360);
+  SpreadsheetApp.getUi().showSidebar(html);
+}
+
+function getSelectedClientDetails() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getActiveSheet();
+
+  if (!sheet || sheet.getName() !== CONFIG.SHEET_MASTER_DATA) {
+    return { error: 'Please switch to the "Master Data" sheet tab.' };
+  }
+  ensureMasterDataSchema(sheet);
+
+  const row = sheet.getActiveRange().getRow();
+  if (row <= 1) return { error: 'Please click on any client row in "Master Data".' };
+  if (row > sheet.getLastRow()) return { error: 'Selected row is empty.' };
+
+  const rowData = sheet.getRange(row, 1, 1, CONFIG.COLS.NOTES).getValues()[0];
+
+  let fileFormula = '';
+  try { fileFormula = sheet.getRange(row, CONFIG.COLS.FILE_LINK).getFormula(); } catch (e) {}
+  const fileId = extractDriveFileId(String(rowData[CONFIG.COLS.FILE_ID - 1] || '').trim()) || extractDriveFileId(fileFormula);
+  const fileUrl = buildDriveViewUrl(fileId);
+
+  const clientName = String(rowData[CONFIG.COLS.CLIENT_NAME - 1] || '');
+  const renewalDate = String(rowData[CONFIG.COLS.RENEWAL_DATE - 1] || '');
+  const company = String(rowData[CONFIG.COLS.COMPANY - 1] || '');
+  const policyNo = String(rowData[CONFIG.COLS.POLICY_NO - 1] || '');
+  const mobile = String(rowData[CONFIG.COLS.CLIENT_MOBILE - 1] || '');
+  const email = String(rowData[CONFIG.COLS.CLIENT_EMAIL - 1] || '');
+
+  let daysRemaining = null;
+  if (renewalDate) {
+    const renDate = new Date(renewalDate);
+    if (!isNaN(renDate.getTime())) {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      renDate.setHours(0, 0, 0, 0);
+      daysRemaining = Math.round((renDate - today) / (1000 * 60 * 60 * 24));
+    }
+  }
+
+  return {
+    rowIndex: row, clientName: clientName, renewalDate: renewalDate, company: company,
+    policyNo: policyNo, mobile: mobile, email: email,
+    status: String(rowData[CONFIG.COLS.STATUS - 1] || ''),
+    fileUrl: fileUrl, fileId: fileId,
+    whatsappUrl: generateWhatsAppLink(mobile, clientName, company, renewalDate, fileUrl, policyNo),
+    gmailUrl: generateGmailComposeLink(email, clientName, company, renewalDate, fileUrl, policyNo),
+    daysRemaining: daysRemaining
+  };
+}
+
+function saveClientContactDetails(rowIndex, mobile, email, policyNo) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.SHEET_MASTER_DATA);
+  if (!sheet || rowIndex <= 1 || rowIndex > sheet.getLastRow()) throw new Error('Invalid row index.');
+
+  const rowData = sheet.getRange(rowIndex, 1, 1, CONFIG.COLS.NOTES).getValues()[0];
+  const clientName = String(rowData[CONFIG.COLS.CLIENT_NAME - 1] || '');
+  const renewalDate = String(rowData[CONFIG.COLS.RENEWAL_DATE - 1] || '');
+  const company = String(rowData[CONFIG.COLS.COMPANY - 1] || '');
+
+  let fileFormula = '';
+  try { fileFormula = sheet.getRange(rowIndex, CONFIG.COLS.FILE_LINK).getFormula(); } catch (e) {}
+  const fileId = extractDriveFileId(String(rowData[CONFIG.COLS.FILE_ID - 1] || '').trim()) || extractDriveFileId(fileFormula);
+  const fileUrl = buildDriveViewUrl(fileId);
+
+  const whatsappUrl = generateWhatsAppLink(mobile, clientName, company, renewalDate, fileUrl, policyNo);
+  const gmailUrl = generateGmailComposeLink(email, clientName, company, renewalDate, fileUrl, policyNo);
+
+  sheet.getRange(rowIndex, CONFIG.COLS.POLICY_NO, 1, 3).setValues([[policyNo || '', mobile || '', email || '']]);
+  sheet.getRange(rowIndex, CONFIG.COLS.WHATSAPP_LINK, 1, 2).setValues([[
+    '=HYPERLINK("' + whatsappUrl + '", "\uD83D\uDCAC Send WhatsApp")',
+    '=HYPERLINK("' + gmailUrl + '", "\uD83D\uDCE7 Send Gmail")'
+  ]]);
+
+  return { success: true, whatsappUrl: whatsappUrl, gmailUrl: gmailUrl };
+}
+
+function getSidebarHtml() {
+  return '<!DOCTYPE html><html><head><base target="_top">' +
+'<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"><style>' +
+'*{box-sizing:border-box;margin:0;padding:0;font-family:Inter,sans-serif}' +
+'body{background:#F8FAFC;color:#1E293B;padding:16px;font-size:13px}' +
+'.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}' +
+'.header h2{font-size:16px;font-weight:700;color:#0F172A}' +
+'.btn-refresh{background:#EEF2F6;border:1px solid #CBD5E1;color:#475569;padding:4px 8px;border-radius:6px;font-size:11px;cursor:pointer;font-weight:600}' +
+'.card{background:#fff;border:1px solid #E2E8F0;border-radius:10px;padding:14px;margin-bottom:14px;box-shadow:0 1px 3px rgba(0,0,0,.05)}' +
+'.card-title{font-size:11px;font-weight:700;text-transform:uppercase;color:#64748B;letter-spacing:.5px;margin-bottom:8px}' +
+'.client-name{font-size:15px;font-weight:700;color:#0F172A;margin-bottom:4px}' +
+'.company-badge{display:inline-block;background:#EFF6FF;color:#1D4ED8;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600;margin-bottom:10px}' +
+'.field-group{margin-bottom:10px}.field-label{font-size:11px;font-weight:600;color:#64748B;margin-bottom:3px}' +
+'.field-input{width:100%;padding:7px 10px;border:1px solid #CBD5E1;border-radius:6px;font-size:12px;color:#1E293B}' +
+'.field-input:focus{outline:none;border-color:#3B82F6}' +
+'.due-badge{display:flex;align-items:center;justify-content:space-between;background:#FEF3C7;color:#92400E;padding:8px 12px;border-radius:6px;font-size:12px;font-weight:600;margin-bottom:12px}' +
+'.due-badge.urgent{background:#FEE2E2;color:#991B1B}.due-badge.ok{background:#D1E7DD;color:#0F5132}' +
+'.btn{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;padding:11px 14px;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;text-decoration:none;margin-bottom:8px}' +
+'.btn-whatsapp{background:#25D366;color:#fff}.btn-gmail{background:#2563EB;color:#fff}' +
+'.btn-save{background:#F1F5F9;color:#334155;border:1px solid #CBD5E1}' +
+'.notice-link{display:inline-flex;gap:4px;color:#2563EB;text-decoration:none;font-weight:600;font-size:12px;margin-top:4px}' +
+'.status-box{padding:8px 10px;border-radius:6px;font-size:11px;margin-top:8px}' +
+'.status-box.success{background:#D1E7DD;color:#0F5132}.status-box.info{background:#E0F2FE;color:#0369A1}' +
+'.status-box.error{background:#FEE2E2;color:#991B1B}.hidden{display:none}' +
+'</style></head><body>' +
+'<div class="header"><h2>Action Center</h2><button class="btn-refresh" onclick="loadSelectedRow()">Refresh</button></div>' +
+'<div id="loader" class="card" style="text-align:center;color:#64748B"><p>Loading active client row...</p></div>' +
+'<div id="error-card" class="card hidden" style="border-left:4px solid #EF4444">' +
+'<p id="error-msg" style="color:#991B1B;font-weight:500"></p>' +
+'<button class="btn-refresh" style="margin-top:8px" onclick="loadSelectedRow()">Click a Row &amp; Refresh</button></div>' +
+'<div id="content" class="hidden"><div class="card">' +
+'<div class="card-title">Selected Client (Row <span id="row-idx"></span>)</div>' +
+'<div class="client-name" id="c-name">Client Name</div>' +
+'<div class="company-badge" id="c-company">Company</div>' +
+'<div id="due-badge" class="due-badge"><span>Renewal Due:</span><span id="c-date">-</span></div>' +
+'<div class="field-group"><label class="field-label">Policy Number</label><input type="text" id="c-policy" class="field-input"></div>' +
+'<div class="field-group"><label class="field-label">Mobile Number (WhatsApp)</label><input type="text" id="c-mobile" class="field-input"></div>' +
+'<div class="field-group"><label class="field-label">Email Address</label><input type="email" id="c-email" class="field-input"></div>' +
+'<div id="file-link-container" style="margin-bottom:10px"><a id="c-pdflink" href="#" target="_blank" class="notice-link">View Notice in Drive</a></div>' +
+'<button class="btn btn-save" onclick="saveContactDetails()">Save Phone / Email to Sheet</button></div>' +
+'<div class="card"><div class="card-title">Instant 1-Click Reminders</div>' +
+'<a id="btn-wa" href="#" target="_blank" class="btn btn-whatsapp">Open WhatsApp Chat</a>' +
+'<a id="btn-gmail" href="#" target="_blank" class="btn btn-gmail">Open in Gmail Compose</a>' +
+'<div id="action-status" class="status-box info hidden"></div></div></div>' +
+'<script>' +
+'var currentData=null;' +
+'window.onload=function(){loadSelectedRow();};' +
+'function loadSelectedRow(){' +
+'document.getElementById("loader").classList.remove("hidden");' +
+'document.getElementById("content").classList.add("hidden");' +
+'document.getElementById("error-card").classList.add("hidden");' +
+'google.script.run.withSuccessHandler(renderClientData).withFailureHandler(showError).getSelectedClientDetails();}' +
+'function renderClientData(d){' +
+'document.getElementById("loader").classList.add("hidden");' +
+'if(d.error){document.getElementById("error-msg").innerText=d.error;document.getElementById("error-card").classList.remove("hidden");return;}' +
+'currentData=d;document.getElementById("content").classList.remove("hidden");' +
+'document.getElementById("row-idx").innerText=d.rowIndex;' +
+'document.getElementById("c-name").innerText=d.clientName||"Unknown Client";' +
+'document.getElementById("c-company").innerText=d.company||"Unknown Company";' +
+'document.getElementById("c-policy").value=d.policyNo||"";' +
+'document.getElementById("c-mobile").value=d.mobile||"";' +
+'document.getElementById("c-email").value=d.email||"";' +
+'var b=document.getElementById("due-badge");b.className="due-badge";' +
+'var t=d.renewalDate||"-";' +
+'if(d.daysRemaining!==null){if(d.daysRemaining<0){b.classList.add("urgent");t=d.renewalDate+" (Overdue)";}' +
+'else if(d.daysRemaining<=30){b.classList.add("urgent");t=d.renewalDate+" ("+d.daysRemaining+" days left)";}' +
+'else{b.classList.add("ok");t=d.renewalDate+" ("+d.daysRemaining+" days left)";}}' +
+'document.getElementById("c-date").innerText=t;' +
+'var p=document.getElementById("c-pdflink");' +
+'if(d.fileUrl){p.href=d.fileUrl;document.getElementById("file-link-container").classList.remove("hidden");}' +
+'else{document.getElementById("file-link-container").classList.add("hidden");}' +
+'document.getElementById("btn-wa").href=d.whatsappUrl;' +
+'document.getElementById("btn-gmail").href=d.gmailUrl;}' +
+'function saveContactDetails(){if(!currentData)return;' +
+'var m=document.getElementById("c-mobile").value.trim();' +
+'var e=document.getElementById("c-email").value.trim();' +
+'var p=document.getElementById("c-policy").value.trim();' +
+'var s=document.getElementById("action-status");s.className="status-box info";' +
+'s.innerText="Saving changes to Sheet...";s.classList.remove("hidden");' +
+'google.script.run.withSuccessHandler(function(r){' +
+'document.getElementById("btn-wa").href=r.whatsappUrl;' +
+'document.getElementById("btn-gmail").href=r.gmailUrl;' +
+'s.className="status-box success";s.innerText="Details saved successfully to Sheet!";})' +
+'.withFailureHandler(showError).saveClientContactDetails(currentData.rowIndex,m,e,p);}' +
+'function showError(err){document.getElementById("loader").classList.add("hidden");' +
+'var s=document.getElementById("action-status");s.className="status-box error";' +
+'s.innerText=(err.message||err.toString());s.classList.remove("hidden");}' +
+'<\/script></body></html>';
+}
+
+// ======================================================================================
+// 11. FLASH-LITE MODEL RESOLUTION
+// ======================================================================================
+
+/**
+ * Returns the Flash-Lite candidate list. Zero discovery HTTP calls.
+ */
+function getAvailableGeminiModels(apiKey) {
+  const list = listGeminiCandidates();
+  _CACHED_MODELS_LIST = list;
+  return list;
+}
+
+/**
+ * Single-file extraction (diagnostics / fallback). Resolves a working Flash-Lite first.
+ */
+function extractRenewalDetailsWithGemini(file, apiKey) {
+  const model = resolveWorkingGeminiModel(apiKey);
+  const blob = (typeof file.getBlob === 'function') ? file.getBlob() : file;
+  const built = buildGeminiRequest(blob, apiKey, model, true);
+  const response = UrlFetchApp.fetch(built.req.url, built.req);
+  const r = parseGeminiResponse(response);
+  if (r.data) return r.data;
+  throw new Error(model + ': ' + r.reason);
+}
+
+// ======================================================================================
+// 12. NORMALIZATION, DATE PARSING & VALIDATION
+// ======================================================================================
+
+function normalizeDateToYYYYMMDD(dateStr) {
+  if (!dateStr) return '';
+  const trimmed = String(dateStr).trim();
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return trimmed;
+
+  const dmy = trimmed.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})$/);
+  if (dmy) return dmy[3] + '-' + dmy[2].padStart(2, '0') + '-' + dmy[1].padStart(2, '0');
+
+  const ymd = trimmed.match(/^(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})$/);
+  if (ymd) return ymd[1] + '-' + ymd[2].padStart(2, '0') + '-' + ymd[3].padStart(2, '0');
+
+  const ts = Date.parse(trimmed.replace(/-/g, ' '));
+  if (!isNaN(ts)) {
+    const d = new Date(ts);
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  }
+  return trimmed;
+}
+
+function validateExtraction(extraction) {
+  if (!extraction) return { isValid: false, reason: 'Extraction payload was empty' };
+
+  const name = String(extraction.clientName || '').trim();
+  const date = String(extraction.renewalDate || '').trim();
+  const company = String(extraction.insuranceCompany || '').trim();
+
+  if (!name || name.toLowerCase() === 'unknown' || name.length < 2) {
+    return { isValid: false, reason: 'Client Name could not be identified' };
+  }
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return { isValid: false, reason: 'Renewal Date missing or invalid format: "' + date + '"' };
+  }
+  if (isNaN(new Date(date).getTime())) {
+    return { isValid: false, reason: 'Renewal Date "' + date + '" is not a valid calendar date' };
+  }
+  if (!company || company.toLowerCase() === 'unknown') {
+    return { isValid: false, reason: 'Insurance Company could not be identified' };
+  }
+  return { isValid: true, reason: '' };
+}
+
+function cleanCompanyName(rawCompany) {
+  if (!rawCompany) return 'INSURANCE';
+  const lower = rawCompany.toLowerCase().trim();
+  for (const key in COMPANY_MAP) {
+    if (lower.indexOf(key) !== -1) return COMPANY_MAP[key];
+  }
+  return rawCompany.replace(/[^a-zA-Z0-9]/g, '_').replace(/_+/g, '_')
+    .replace(/^_|_$/g, '').toUpperCase() || 'INSURANCE';
+}
+
+function cleanClientNameForFilename(rawName) {
+  if (!rawName) return 'Client';
+  return rawName
+    .replace(/^(mr|mrs|ms|dr|prof|shri|smt)\.?\s+/i, '')
+    .replace(/[^a-zA-Z0-9\s]/g, '')
+    .trim().split(/\s+/)
+    .map(function (w) { return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase(); })
+    .join('_') || 'Client';
+}
+
+function formatMonthYear(dateStr) {
+  if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return 'UNKNOWN';
+  const parts = dateStr.split('-');
+  const monthNames = ['January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'];
+  return monthNames[parseInt(parts[1], 10) - 1] + ' ' + parts[0];
+}
+
+// ======================================================================================
+// 13. GOOGLE SHEETS MANAGEMENT
+// ======================================================================================
+
+const MASTER_HEADERS = [
+  'Sr No', 'Client Name', 'Renewal Date', 'Month', 'Company', 'Policy Number',
+  'Client Mobile', 'Client Email', '\uD83D\uDCAC WhatsApp Action', '\uD83D\uDCE7 Gmail Action',
+  'File Name', 'File Link', 'Folder Name', 'Folder Link', 'Status',
+  'Date Processed', 'Original File Name', 'Drive File ID', 'Notes / Error Reason'
+];
+
+function ensureMasterDataSchema(sheet) {
+  if (!sheet || sheet.getName() !== CONFIG.SHEET_MASTER_DATA) return;
+  const lastCol = sheet.getLastColumn();
+  if (lastCol === 0) return;
+  const col10Header = String(sheet.getRange(1, Math.min(10, lastCol)).getValue() || '').trim();
+  if (col10Header === 'File Name' || lastCol < 18 || col10Header.indexOf('Email Status') !== -1) {
+    migrateMasterDataSchema(sheet);
+  }
+}
+
+function applyMasterColumnWidths(sheet) {
+  sheet.setColumnWidth(CONFIG.COLS.SR_NO, 60);
+  sheet.setColumnWidth(CONFIG.COLS.CLIENT_NAME, 160);
+  sheet.setColumnWidth(CONFIG.COLS.RENEWAL_DATE, 110);
+  sheet.setColumnWidth(CONFIG.COLS.MONTH, 130);
+  sheet.setColumnWidth(CONFIG.COLS.COMPANY, 140);
+  sheet.setColumnWidth(CONFIG.COLS.POLICY_NO, 130);
+  sheet.setColumnWidth(CONFIG.COLS.CLIENT_MOBILE, 130);
+  sheet.setColumnWidth(CONFIG.COLS.CLIENT_EMAIL, 180);
+  sheet.setColumnWidth(CONFIG.COLS.WHATSAPP_LINK, 150);
+  sheet.setColumnWidth(CONFIG.COLS.EMAIL_ACTION, 150);
+  sheet.setColumnWidth(CONFIG.COLS.FILE_NAME, 240);
+  sheet.setColumnWidth(CONFIG.COLS.FILE_LINK, 100);
+  sheet.setColumnWidth(CONFIG.COLS.FOLDER_NAME, 130);
+  sheet.setColumnWidth(CONFIG.COLS.FOLDER_LINK, 110);
+  sheet.setColumnWidth(CONFIG.COLS.STATUS, 120);
+  sheet.setColumnWidth(CONFIG.COLS.DATE_PROCESSED, 140);
+  sheet.setColumnWidth(CONFIG.COLS.ORIGINAL_NAME, 200);
+  sheet.setColumnWidth(CONFIG.COLS.FILE_ID, 100);
+  sheet.setColumnWidth(CONFIG.COLS.NOTES, 260);
+}
+
+function setupMasterDataSheet(ss) {
+  let sheet = ss.getSheetByName(CONFIG.SHEET_MASTER_DATA);
+  if (!sheet) sheet = ss.insertSheet(CONFIG.SHEET_MASTER_DATA, 0);
+
+  ensureMasterDataSchema(sheet);
+
+  const headerRange = sheet.getRange(1, 1, 1, MASTER_HEADERS.length);
+  headerRange.setValues([MASTER_HEADERS]);
+  headerRange.setBackground('#1A365D').setFontColor('#FFFFFF').setFontWeight('bold')
+    .setFontFamily('Roboto').setFontSize(10)
+    .setHorizontalAlignment('center').setVerticalAlignment('middle');
+
+  sheet.setRowHeight(1, 36);
+  sheet.setFrozenRows(1);
+  applyMasterColumnWidths(sheet);
+  sheet.hideColumns(CONFIG.COLS.FILE_ID);
+
+  if (!sheet.getFilter()) {
+    sheet.getRange(1, 1, Math.max(sheet.getLastRow(), 2), MASTER_HEADERS.length).createFilter();
+  }
+  return sheet;
+}
+
+function buildMasterRowValues(rowData) {
+  const publicFileUrl = getPublicShareUrl(rowData.fileUrl);
+  return [
+    rowData.srNo, rowData.clientName, rowData.renewalDate, rowData.month, rowData.company,
+    rowData.policyNumber || '', rowData.clientMobile || '', rowData.clientEmail || '',
+    rowData.whatsappUrl ? ('=HYPERLINK("' + rowData.whatsappUrl + '", "\uD83D\uDCAC Send WhatsApp")') : '\u2014',
+    rowData.gmailUrl ? ('=HYPERLINK("' + rowData.gmailUrl + '", "\uD83D\uDCE7 Send Gmail")') : '\u2014',
+    rowData.fileName,
+    publicFileUrl ? ('=HYPERLINK("' + publicFileUrl + '", "\uD83D\uDCC4 Open PDF")') : '',
+    rowData.folderName,
+    rowData.folderUrl ? ('=HYPERLINK("' + rowData.folderUrl + '", "\uD83D\uDCC1 Open Folder")') : '',
+    rowData.status, rowData.dateProcessed, rowData.originalName, rowData.fileId, rowData.notes
+  ];
+}
+
+/** Applies all row formatting in bulk ranges (was ~15 calls PER ROW). */
+function formatMasterRange(sheet, startRow, numRows, statuses) {
+  if (numRows <= 0) return;
+
+  sheet.getRange(startRow, 1, numRows, CONFIG.COLS.NOTES)
+    .setFontFamily('Roboto').setFontSize(9).setVerticalAlignment('middle');
+
+  sheet.setRowHeights(startRow, numRows, 26);
+
+  [CONFIG.COLS.SR_NO, CONFIG.COLS.RENEWAL_DATE, CONFIG.COLS.FILE_LINK,
+   CONFIG.COLS.FOLDER_LINK, CONFIG.COLS.STATUS, CONFIG.COLS.DATE_PROCESSED
+  ].forEach(function (col) {
+    sheet.getRange(startRow, col, numRows, 1).setHorizontalAlignment('center');
+  });
+
+  sheet.getRange(startRow, CONFIG.COLS.WHATSAPP_LINK, numRows, 1)
+    .setHorizontalAlignment('center').setFontWeight('bold').setFontColor('#0F5132');
+  sheet.getRange(startRow, CONFIG.COLS.EMAIL_ACTION, numRows, 1)
+    .setHorizontalAlignment('center').setFontWeight('bold').setFontColor('#1E40AF');
+
+  const bg = [];
+  const fc = [];
+  statuses.forEach(function (s) {
+    if (s === 'SUCCESS') { bg.push(['#D1E7DD']); fc.push(['#0F5132']); }
+    else if (s === 'NEEDS REVIEW') { bg.push(['#FFF3CD']); fc.push(['#664D03']); }
+    else { bg.push(['#F8D7DA']); fc.push(['#842029']); }
+  });
+  sheet.getRange(startRow, CONFIG.COLS.STATUS, numRows, 1)
+    .setBackgrounds(bg).setFontColors(fc).setFontWeight('bold');
+}
+
+/** Writes all new rows in ONE setValues call, then formats the block at once. */
+function flushMasterRows(sheet, appendRows, updateRows) {
+  if (appendRows && appendRows.length > 0) {
+    const startRow = sheet.getLastRow() + 1;
+    sheet.getRange(startRow, 1, appendRows.length, MASTER_HEADERS.length)
+      .setValues(appendRows.map(function (r) { return r.values; }));
+    formatMasterRange(sheet, startRow, appendRows.length,
+      appendRows.map(function (r) { return r.status; }));
+  }
+
+  if (updateRows && updateRows.length > 0) {
+    updateRows.forEach(function (u) {
+      sheet.getRange(u.rowIndex, 1, 1, MASTER_HEADERS.length).setValues([u.values]);
+      formatMasterRange(sheet, u.rowIndex, 1, [u.status]);
+    });
+  }
+}
+
+function appendOrUpdateMasterRow(sheet, existingMeta, rowData) {
+  const values = buildMasterRowValues(rowData);
+  if (existingMeta && existingMeta.rowIndex) {
+    flushMasterRows(sheet, [], [{ rowIndex: existingMeta.rowIndex, values: values, status: rowData.status }]);
+  } else {
+    flushMasterRows(sheet, [{ values: values, status: rowData.status }], []);
+  }
+}
+
+function migrateMasterDataSchema(sheet) {
+  const lastRow = sheet.getLastRow();
+  const oldCols = sheet.getLastColumn();
+  if (lastRow <= 0 || oldCols <= 0) return;
+
+  const newRows = [];
+  const statuses = [];
+  const idsToShare = [];
+
+  if (lastRow >= 2) {
+    const oldData = sheet.getRange(2, 1, lastRow - 1, oldCols).getValues();
+    const oldFormulas = sheet.getRange(2, 1, lastRow - 1, oldCols).getFormulas();
+
+    for (let i = 0; i < oldData.length; i++) {
+      const row = oldData[i];
+      const formRow = oldFormulas[i];
+
+      const srNo = row[0] || (i + 1);
+      const clientName = String(row[1] || '');
+      const renewalDate = String(row[2] || '');
+      const month = String(row[3] || '');
+      const company = String(row[4] || '');
+
+      let policyNumber = '', clientMobile = '', clientEmail = '', fileName = '';
+      let fileLinkFormula = '', folderName = '', folderLinkFormula = '';
+      let status = 'SUCCESS', dateProcessed = '', originalName = '', fileId = '', notes = '';
+
+      if (oldCols >= 18) {
+        policyNumber = String(row[CONFIG.COLS.POLICY_NO - 1] || '');
+        clientMobile = String(row[CONFIG.COLS.CLIENT_MOBILE - 1] || '');
+        clientEmail = String(row[CONFIG.COLS.CLIENT_EMAIL - 1] || '');
+        fileName = String(row[CONFIG.COLS.FILE_NAME - 1] || '');
+        fileLinkFormula = formRow[CONFIG.COLS.FILE_LINK - 1] || '';
+        folderName = String(row[CONFIG.COLS.FOLDER_NAME - 1] || '');
+        folderLinkFormula = formRow[CONFIG.COLS.FOLDER_LINK - 1] || '';
+        status = String(row[CONFIG.COLS.STATUS - 1] || 'SUCCESS');
+        dateProcessed = String(row[CONFIG.COLS.DATE_PROCESSED - 1] || '');
+        originalName = String(row[CONFIG.COLS.ORIGINAL_NAME - 1] || '');
+        fileId = extractDriveFileId(String(row[CONFIG.COLS.FILE_ID - 1] || '')) || extractDriveFileId(fileLinkFormula);
+        notes = String(row[CONFIG.COLS.NOTES - 1] || '');
+      } else {
+        fileName = String(row[5] || '');
+        fileLinkFormula = formRow[6] || (row[6] ? ('=HYPERLINK("' + row[6] + '", "\uD83D\uDCC4 Open PDF")') : '');
+        folderName = String(row[7] || '');
+        folderLinkFormula = formRow[8] || (row[8] ? ('=HYPERLINK("' + row[8] + '", "\uD83D\uDCC1 Open Folder")') : '');
+        status = String(row[9] || 'SUCCESS');
+        dateProcessed = String(row[10] || '');
+        originalName = String(row[11] || '');
+        fileId = extractDriveFileId(String(row[12] || '')) || extractDriveFileId(fileLinkFormula);
+        notes = String(row[13] || '');
+      }
+
+      if (!fileId) {
+        const match = String(fileLinkFormula).match(/HYPERLINK\("([^"]+)"/i);
+        if (match) fileId = extractDriveFileId(match[1]);
+      }
+
+      const fileUrl = buildDriveViewUrl(fileId);
+      if (fileId) idsToShare.push(fileId);
+
+      const whatsappUrl = generateWhatsAppLink(clientMobile, clientName, company, renewalDate, fileUrl, policyNumber);
+      const gmailUrl = generateGmailComposeLink(clientEmail, clientName, company, renewalDate, fileUrl, policyNumber);
+
+      newRows.push([
+        srNo, clientName, renewalDate, month, company, policyNumber, clientMobile, clientEmail,
+        '=HYPERLINK("' + whatsappUrl + '", "\uD83D\uDCAC Send WhatsApp")',
+        '=HYPERLINK("' + gmailUrl + '", "\uD83D\uDCE7 Send Gmail")',
+        fileName,
+        fileUrl ? ('=HYPERLINK("' + fileUrl + '", "\uD83D\uDCC4 Open PDF")') : fileLinkFormula,
+        folderName, folderLinkFormula,
+        status, dateProcessed, originalName, fileId, notes
+      ]);
+      statuses.push(status);
+    }
+  }
+
+  sheet.clear();
+
+  const headerRange = sheet.getRange(1, 1, 1, MASTER_HEADERS.length);
+  headerRange.setValues([MASTER_HEADERS]);
+  headerRange.setBackground('#1A365D').setFontColor('#FFFFFF').setFontWeight('bold')
+    .setFontFamily('Roboto').setFontSize(10)
+    .setHorizontalAlignment('center').setVerticalAlignment('middle');
+
+  sheet.setRowHeight(1, 36);
+  sheet.setFrozenRows(1);
+  applyMasterColumnWidths(sheet);
+  sheet.hideColumns(CONFIG.COLS.FILE_ID);
+
+  if (newRows.length > 0) {
+    sheet.getRange(2, 1, newRows.length, MASTER_HEADERS.length).setValues(newRows);
+    formatMasterRange(sheet, 2, newRows.length, statuses);
+    bulkShareFileIds(idsToShare);
+  }
+
+  if (!sheet.getFilter()) {
+    sheet.getRange(1, 1, Math.max(sheet.getLastRow(), 2), MASTER_HEADERS.length).createFilter();
+  }
+}
+
+function setupMonthlySummarySheet(ss) {
+  let sheet = ss.getSheetByName(CONFIG.SHEET_MONTHLY_SUMMARY);
+  if (!sheet) sheet = ss.insertSheet(CONFIG.SHEET_MONTHLY_SUMMARY, 1);
+
+  const headers = ['Month', 'Number of Renewal Notices', 'Folder Link'];
+  const headerRange = sheet.getRange(1, 1, 1, headers.length);
+  headerRange.setValues([headers]);
+  headerRange.setBackground('#2B6CB0').setFontColor('#FFFFFF').setFontWeight('bold')
+    .setFontFamily('Roboto').setFontSize(10)
+    .setHorizontalAlignment('center').setVerticalAlignment('middle');
+
+  sheet.setRowHeight(1, 32);
+  sheet.setFrozenRows(1);
+  sheet.setColumnWidth(1, 180);
+  sheet.setColumnWidth(2, 200);
+  sheet.setColumnWidth(3, 140);
+  return sheet;
+}
+
+function getExistingFileMap(sheet) {
+  const map = new Map();
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return map;
+
+  const data = sheet.getRange(2, 1, lastRow - 1, CONFIG.COLS.NOTES).getValues();
+  const formulas = sheet.getRange(2, CONFIG.COLS.FILE_LINK, lastRow - 1, 1).getFormulas();
+
+  for (let i = 0; i < data.length; i++) {
+    const row = data[i];
+    const fileId = extractDriveFileId(row[CONFIG.COLS.FILE_ID - 1]) || extractDriveFileId(formulas[i][0] || '');
+    if (fileId) {
+      map.set(String(fileId).trim(), {
+        rowIndex: i + 2,
+        srNo: row[CONFIG.COLS.SR_NO - 1],
+        status: row[CONFIG.COLS.STATUS - 1],
+        originalName: row[CONFIG.COLS.ORIGINAL_NAME - 1]
+      });
+    }
+  }
+  return map;
+}
+
+function getNextSerialNumber(sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return 1;
+  const srValues = sheet.getRange(2, CONFIG.COLS.SR_NO, lastRow - 1, 1).getValues();
+  let maxSr = 0;
+  for (let i = 0; i < srValues.length; i++) {
+    const val = Number(srValues[i][0]);
+    if (!isNaN(val) && val > maxSr) maxSr = val;
+  }
+  return maxSr + 1;
+}
+
+/**
+ * Rebuilds the Monthly Summary tab.
+ * OPTIMIZED: one batched getFormulas() read instead of a getFormula() call per row.
+ */
+function refreshMonthlySummary() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const masterSheet = ss.getSheetByName(CONFIG.SHEET_MASTER_DATA);
+  const summarySheet = ss.getSheetByName(CONFIG.SHEET_MONTHLY_SUMMARY) || setupMonthlySummarySheet(ss);
+  if (!masterSheet) return;
+
+  const lastRow = masterSheet.getLastRow();
+  if (lastRow <= 1) {
+    const sLastRow = summarySheet.getLastRow();
+    if (sLastRow > 1) summarySheet.getRange(2, 1, sLastRow - 1, 3).clearContent().clearFormat();
+    return;
+  }
+
+  const numRows = lastRow - 1;
+  const data = masterSheet.getRange(2, 1, numRows, CONFIG.COLS.NOTES).getValues();
+  const folderFormulas = masterSheet.getRange(2, CONFIG.COLS.FOLDER_LINK, numRows, 1).getFormulas();
+
+  const monthNames = ['January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'];
+  const monthMap = new Map();
+
+  for (let i = 0; i < numRows; i++) {
+    const row = data[i];
+    const status = String(row[CONFIG.COLS.STATUS - 1] || '');
+    let month = row[CONFIG.COLS.MONTH - 1];
+
+    if (month instanceof Date) {
+      month = monthNames[month.getMonth()] + ' ' + month.getFullYear();
+    } else {
+      month = String(month || '').trim();
+    }
+
+    if (status !== 'SUCCESS' || !month || month === 'UNKNOWN' || month === 'ERROR') continue;
+
+    let folderUrl = '';
+    const match = String(folderFormulas[i][0] || '').match(/HYPERLINK\("([^"]+)"/i);
+    if (match) folderUrl = match[1];
+
+    if (!monthMap.has(month)) monthMap.set(month, { count: 0, folderUrl: folderUrl });
+    const entry = monthMap.get(month);
+    entry.count += 1;
+    if (!entry.folderUrl && folderUrl) entry.folderUrl = folderUrl;
+  }
+
+  const sLastRow = summarySheet.getLastRow();
+  if (sLastRow > 1) summarySheet.getRange(2, 1, sLastRow - 1, 3).clear();
+  if (monthMap.size === 0) return;
+
+  const sortedMonths = Array.from(monthMap.keys()).sort(function (a, b) {
+    const dA = new Date(Date.parse('01 ' + String(a || '')));
+    const dB = new Date(Date.parse('01 ' + String(b || '')));
+    if (!isNaN(dA.getTime()) && !isNaN(dB.getTime())) return dA.getTime() - dB.getTime();
+    return String(a).localeCompare(String(b));
+  });
+
+  const summaryRows = sortedMonths.map(function (m) {
+    const info = monthMap.get(m);
+    return [m, info.count, info.folderUrl ? ('=HYPERLINK("' + info.folderUrl + '", "\uD83D\uDCC1 Open Folder")') : '\u2014'];
+  });
+
+  const targetRange = summarySheet.getRange(2, 1, summaryRows.length, 3);
+  targetRange.setValues(summaryRows);
+  targetRange.setFontFamily('Roboto').setFontSize(10).setVerticalAlignment('middle');
+  summarySheet.getRange(2, 1, summaryRows.length, 1).setFontWeight('bold');
+  summarySheet.getRange(2, 2, summaryRows.length, 2).setHorizontalAlignment('center');
+  summarySheet.setRowHeights(2, summaryRows.length, 26);
+}
+
+// ======================================================================================
+// 14. TESTING & DIAGNOSTICS
+// ======================================================================================
+
+function testGeminiConnection() {
+  const ui = SpreadsheetApp.getUi();
+  const props = PropertiesService.getScriptProperties();
+  const apiKey = props.getProperty(CONFIG.PROP_GEMINI_KEY);
+
+  if (!apiKey) {
+    ui.alert('Missing API Key', 'Please set your Gemini API key first.', ui.ButtonSet.OK);
+    return;
+  }
+
+  _ACTIVE_WORKING_MODEL = null;
+  try { props.deleteProperty(CONFIG.PROP_ACTIVE_MODEL); } catch (e) {}
+
+  const candidates = listGeminiCandidates();
+  const notes = [];
+  let lastBody = '';
+
+  for (let i = 0; i < candidates.length; i++) {
+    const testModel = candidates[i];
+    const url = 'https://generativelanguage.googleapis.com/' + CONFIG.GEMINI_API_VERSION +
+                '/models/' + testModel + ':generateContent?key=' + apiKey;
+    try {
+      const res = UrlFetchApp.fetch(url, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: 'Reply with the single word CONNECTED.' }] }],
+          generationConfig: {
+            maxOutputTokens: 16,
+            thinkingConfig: thinkingConfigFor(testModel)
+          }
+        }),
+        muteHttpExceptions: true
+      });
+      const code = res.getResponseCode();
+      lastBody = res.getContentText();
+      notes.push(testModel + ' -> HTTP ' + code);
+      if (code === 200) {
+        _ACTIVE_WORKING_MODEL = testModel;
+        try { props.setProperty(CONFIG.PROP_ACTIVE_MODEL, testModel); } catch (e) {}
+        let extra = '';
+        if (testModel !== CONFIG.GEMINI_MODEL) {
+          extra = '\n\nPreferred ' + CONFIG.GEMINI_MODEL + ' returned 404 for this API key ' +
+                  '(Google now blocks 2.5 Flash-Lite for many new keys). ' +
+                  'Using ' + testModel + ' instead — same Flash-Lite class, fastest available.';
+        }
+        ui.alert('Gemini Connection: SUCCESS',
+          'Connected to the Google Gemini API.\n\n' +
+          '\u2022 Active Model: ' + testModel + extra + '\n\n' +
+          notes.join('\n'),
+          ui.ButtonSet.OK);
+        return;
+      }
+    } catch (err) {
+      notes.push(testModel + ' -> ' + err.message);
+    }
+  }
+
+  ui.alert('Connection Failed',
+    'None of the Flash-Lite models accepted this key.\n\n' + notes.join('\n') +
+    '\n\n' + String(lastBody).substring(0, 400),
+    ui.ButtonSet.OK);
+}
+
+/**
+ * Full extraction diagnostic. Shows exactly why a PDF fails: which model was used,
+ * whether text extraction produced real text or stream noise, the HTTP status, and
+ * the raw API reply.
+ */
+function diagnoseOneFile() {
+  const props = PropertiesService.getScriptProperties();
+  const apiKey = props.getProperty(CONFIG.PROP_GEMINI_KEY);
+  const reviewId = props.getProperty(CONFIG.PROP_NEEDS_REVIEW_FOLDER_ID);
+  const inboxId = props.getProperty(CONFIG.PROP_INBOX_FOLDER_ID);
+  const out = [];
+
+  out.push('API KEY: ' + (apiKey ? 'present' : 'MISSING'));
+
+  let file = null;
+  [reviewId, inboxId].forEach(function (id) {
+    if (file || !id) return;
+    try {
+      const folder = DriveApp.getFolderById(id);
+      out.push('SCANNING: ' + folder.getName());
+      const it = folder.getFiles();
+      while (it.hasNext()) {
+        const f = it.next();
+        if (!file && f.getName().toLowerCase().indexOf('.pdf') !== -1) file = f;
+      }
+    } catch (e) {
+      out.push('FOLDER ERROR: ' + e.message);
+    }
+  });
+
+  if (!file) {
+    out.push('>>> NO PDF FOUND in NEEDS REVIEW or INBOX.');
+    Logger.log(out.join('\n'));
+    try { SpreadsheetApp.getUi().alert(out.join('\n')); } catch (e) {}
+    return;
+  }
+
+  out.push('FILE: ' + file.getName());
+  out.push('SIZE: ' + file.getSize() + ' bytes');
+
+  try {
+    const blob = file.getBlob();
+    const txt = extractTextFromPdfBlob(blob);
+    if (txt) {
+      out.push('MODE: TEXT (' + txt.length + ' chars) - ' + scoreExtractedText(txt).why);
+      out.push('SAMPLE: ' + txt.substring(0, 200));
+    } else {
+      out.push('MODE: FULL PDF (no usable text layer - correct for scanned or compressed PDFs)');
+    }
+
+    const model = resolveWorkingGeminiModel(apiKey);
+    out.push('MODEL: ' + model + ' (Flash-Lite, thinking off/minimal)');
+
+    const built = buildGeminiRequest(blob, apiKey, model, true);
+    const r = UrlFetchApp.fetch(built.req.url, built.req);
+    const code = r.getResponseCode();
+    out.push('HTTP: ' + code);
+
+    if (code === 503) {
+      out.push('>>> The model is temporarily overloaded on Google\'s side. This is not a');
+      out.push('    problem with your file or key. Wait 2-3 minutes and try again.');
+    } else if (code === 429) {
+      out.push('>>> Rate limit reached. Wait a minute and try again.');
+    }
+
+    const parsed = parseGeminiResponse(r);
+    out.push('PARSE RESULT: ' + (parsed.data ? 'OK' : parsed.reason));
+    if (parsed.data) out.push('EXTRACTED: ' + JSON.stringify(parsed.data));
+    out.push('RAW REPLY: ' + r.getContentText().substring(0, 900));
+  } catch (err) {
+    out.push('EXCEPTION: ' + err.message);
+  }
+
+  Logger.log(out.join('\n'));
+  try { SpreadsheetApp.getUi().alert(out.join('\n').substring(0, 1400)); } catch (e) {}
+}
+
+// ======================================================================================
+// 15. WEB APPLICATION PORTAL (doGet & BACKEND RPC HANDLERS)
+// ======================================================================================
+
+function doGet(e) {
+  return HtmlService.createHtmlOutput(getWebAppHtml())
+    .setTitle('Insurance Renewal Portal')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+/**
+ * Dashboard payload.
+ * OPTIMIZED: no Drive sharing call per row, so dashboard loads are near-instant
+ * regardless of how many clients are in the sheet.
+ */
+function fetchDashboardData() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) return { error: 'Spreadsheet not accessible.' };
+
+  const masterSheet = ss.getSheetByName(CONFIG.SHEET_MASTER_DATA);
+  if (!masterSheet) return { error: 'Master Data sheet not found. Please run system setup.' };
+
+  ensureMasterDataSchema(masterSheet);
+
+  const lastRow = masterSheet.getLastRow();
+  if (lastRow <= 1) {
+    return {
+      stats: { total: 0, dueIn7Days: 0, dueIn30Days: 0, overdue: 0, needsReview: 0 },
+      months: [], companies: [], clients: []
+    };
+  }
+
+  const numRows = lastRow - 1;
+  const data = masterSheet.getRange(2, 1, numRows, CONFIG.COLS.NOTES).getValues();
+  const formulas = masterSheet.getRange(2, 1, numRows, CONFIG.COLS.NOTES).getFormulas();
+
+  const clients = [];
+  const monthSet = new Set();
+  const companySet = new Set();
+  let dueIn7Days = 0, dueIn30Days = 0, overdue = 0, needsReview = 0;
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  for (let i = 0; i < numRows; i++) {
+    const row = data[i];
+    const formRow = formulas[i];
+
+    const clientName = String(row[CONFIG.COLS.CLIENT_NAME - 1] || '').trim();
+    const renewalDate = String(row[CONFIG.COLS.RENEWAL_DATE - 1] || '').trim();
+    const month = String(row[CONFIG.COLS.MONTH - 1] || '').trim();
+    const company = String(row[CONFIG.COLS.COMPANY - 1] || '').trim();
+    const policyNo = String(row[CONFIG.COLS.POLICY_NO - 1] || '').trim();
+    const mobile = String(row[CONFIG.COLS.CLIENT_MOBILE - 1] || '').trim();
+    const email = String(row[CONFIG.COLS.CLIENT_EMAIL - 1] || '').trim();
+    const status = String(row[CONFIG.COLS.STATUS - 1] || 'SUCCESS').trim();
+    const notes = String(row[CONFIG.COLS.NOTES - 1] || '').trim();
+
+    const fileFormula = String(formRow[CONFIG.COLS.FILE_LINK - 1] || '');
+    const folderFormula = String(formRow[CONFIG.COLS.FOLDER_LINK - 1] || '');
+    const fileId = extractDriveFileId(String(row[CONFIG.COLS.FILE_ID - 1] || '').trim()) || extractDriveFileId(fileFormula);
+    const fileUrl = buildDriveViewUrl(fileId);
+
+    let folderUrl = '';
+    const folderMatch = folderFormula.match(/HYPERLINK\("([^"]+)"/i);
+    if (folderMatch) folderUrl = folderMatch[1];
+
+    if (month && month !== 'UNKNOWN' && month !== 'ERROR') monthSet.add(month);
+    if (company && company !== 'UNKNOWN' && company !== 'ERROR') companySet.add(company);
+
+    let daysRemaining = null;
+    if (renewalDate && /^\d{4}-\d{2}-\d{2}$/.test(renewalDate)) {
+      const renDate = new Date(renewalDate);
+      if (!isNaN(renDate.getTime())) {
+        renDate.setHours(0, 0, 0, 0);
+        daysRemaining = Math.round((renDate - today) / (1000 * 60 * 60 * 24));
+        if (daysRemaining < 0) overdue++;
+        else if (daysRemaining <= 7) dueIn7Days++;
+        else if (daysRemaining <= 30) dueIn30Days++;
+      }
+    }
+
+    if (status === 'NEEDS REVIEW' || status === 'ERROR') needsReview++;
+
+    clients.push({
+      rowIndex: i + 2, srNo: row[CONFIG.COLS.SR_NO - 1],
+      clientName: clientName, renewalDate: renewalDate, month: month, company: company,
+      policyNo: policyNo, mobile: mobile, email: email, status: status,
+      fileUrl: fileUrl, folderUrl: folderUrl,
+      whatsappUrl: generateWhatsAppLink(mobile, clientName, company, renewalDate, fileUrl, policyNo),
+      gmailUrl: generateGmailComposeLink(email, clientName, company, renewalDate, fileUrl, policyNo),
+      daysRemaining: daysRemaining, notes: notes
+    });
+  }
+
+  clients.sort(function (a, b) {
+    if (!a.renewalDate) return 1;
+    if (!b.renewalDate) return -1;
+    return a.renewalDate.localeCompare(b.renewalDate);
+  });
+
+  return {
+    stats: {
+      total: clients.length, dueIn7Days: dueIn7Days, dueIn30Days: dueIn30Days,
+      overdue: overdue, needsReview: needsReview
+    },
+    months: Array.from(monthSet),
+    companies: Array.from(companySet).sort(),
+    clients: clients
+  };
+}
+
+/**
+ * Uploads base64 PDFs to INBOX and runs the pipeline.
+ * OPTIMIZED: no per-file setSharing on upload; sharing happens in the parallel batch.
+ */
+function uploadFilesAndProcess(filesList) {
+  const props = PropertiesService.getScriptProperties();
+  const inboxId = props.getProperty(CONFIG.PROP_INBOX_FOLDER_ID);
+
+  if (!inboxId || !folderExists(inboxId)) {
+    throw new Error('Inbox folder not found. Please run System Setup first.');
+  }
+
+  const inboxFolder = DriveApp.getFolderById(inboxId);
+  let uploadCount = 0;
+
+  if (Array.isArray(filesList)) {
+    filesList.forEach(function (fileObj) {
+      if (fileObj.base64 && fileObj.name) {
+        const decoded = Utilities.base64Decode(fileObj.base64);
+        inboxFolder.createFile(Utilities.newBlob(decoded, fileObj.type || 'application/pdf', fileObj.name));
+        uploadCount++;
+      }
+    });
+  }
+
+  const stats = processInbox();
+  return {
+    uploaded: uploadCount, processed: stats.processed, success: stats.success,
+    needsReview: stats.needsReview, skipped: stats.skipped, remaining: stats.remaining,
+    overloaded: stats.overloaded, elapsedSeconds: stats.elapsedSeconds
+  };
+}
+
+function triggerBatchProcessFromWeb() { return processInbox(); }
+function triggerNeedsReviewFromWeb() { return processNeedsReview(); }
+function saveClientFromWeb(rowIndex, mobile, email, policyNo) {
+  return saveClientContactDetails(rowIndex, mobile, email, policyNo);
+}
+
+function getWebAppHtml() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Insurance Renewal Portal</title>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{--primary:#2563EB;--primary-dark:#1D4ED8;--primary-light:#EFF6FF;--success:#10B981;
+--success-light:#ECFDF5;--warning:#F59E0B;--warning-light:#FFFBEB;--danger:#EF4444;
+--danger-light:#FEF2F2;--dark:#0F172A;--slate:#334155;--muted:#64748B;--border:#E2E8F0;
+--bg:#F8FAFC;--card-bg:#FFFFFF;--shadow:0 4px 6px -1px rgba(0,0,0,.05);
+--shadow-lg:0 10px 15px -3px rgba(0,0,0,.07)}
+*{box-sizing:border-box;margin:0;padding:0;font-family:'Plus Jakarta Sans',sans-serif}
+body{background:var(--bg);color:var(--dark);line-height:1.5;min-height:100vh;display:flex;flex-direction:column}
+.top-nav{background:#0F172A;color:#fff;padding:14px 24px;display:flex;align-items:center;
+justify-content:space-between;position:sticky;top:0;z-index:100}
+.nav-brand{display:flex;align-items:center;gap:12px}
+.brand-icon{background:linear-gradient(135deg,#3B82F6,#1D4ED8);width:40px;height:40px;
+border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px}
+.brand-title{font-size:17px;font-weight:800}
+.brand-subtitle{font-size:11px;color:#94A3B8;font-weight:500}
+.btn-sync{background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);color:#fff;
+padding:8px 14px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer}
+.container{max-width:1280px;margin:0 auto;padding:24px 20px;width:100%;flex:1}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;margin-bottom:24px}
+.stat-card{background:var(--card-bg);border:1px solid var(--border);border-radius:12px;
+padding:16px 20px;box-shadow:var(--shadow);display:flex;align-items:center;gap:14px}
+.stat-icon{width:46px;height:46px;border-radius:12px;display:flex;align-items:center;
+justify-content:center;font-size:22px;flex-shrink:0}
+.stat-icon.blue{background:var(--primary-light);color:var(--primary)}
+.stat-icon.red{background:var(--danger-light);color:var(--danger)}
+.stat-icon.amber{background:var(--warning-light);color:var(--warning)}
+.stat-icon.green{background:var(--success-light);color:var(--success)}
+.stat-value{font-size:24px;font-weight:800;line-height:1.1}
+.stat-label{font-size:12px;font-weight:600;color:var(--muted);margin-top:2px}
+.upload-card{background:var(--card-bg);border:2px dashed #93C5FD;border-radius:14px;
+padding:24px;text-align:center;margin-bottom:24px;box-shadow:var(--shadow)}
+.upload-card.dragover{background:var(--primary-light);border-color:var(--primary)}
+.upload-icon{font-size:38px;margin-bottom:10px;color:var(--primary)}
+.upload-title{font-size:16px;font-weight:700;margin-bottom:4px}
+.upload-desc{font-size:12px;color:var(--muted);margin-bottom:14px}
+.file-input{display:none}
+.btn-browse{display:inline-block;background:var(--primary);color:#fff;padding:9px 20px;
+border-radius:8px;font-size:13px;font-weight:600;cursor:pointer}
+.queued-files-list{margin-top:16px;text-align:left;display:flex;flex-direction:column;gap:8px}
+.queued-item{background:#F1F5F9;padding:8px 14px;border-radius:8px;font-size:12px;
+display:flex;align-items:center;justify-content:space-between;font-weight:600}
+.queued-remove{color:var(--danger);cursor:pointer;font-size:14px}
+.btn-process-now{margin-top:14px;background:linear-gradient(135deg,#10B981,#059669);color:#fff;
+border:none;padding:12px 28px;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer}
+.controls-bar{background:var(--card-bg);border:1px solid var(--border);border-radius:12px;
+padding:14px 18px;margin-bottom:20px;display:flex;flex-wrap:wrap;gap:12px;
+align-items:center;justify-content:space-between;box-shadow:var(--shadow)}
+.search-box{flex:1;min-width:240px;position:relative}
+.search-input{width:100%;padding:10px 14px 10px 38px;border:1px solid var(--border);
+border-radius:8px;font-size:13px;background:#F8FAFC}
+.search-icon{position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:14px;color:var(--muted)}
+.filter-group{display:flex;gap:8px;flex-wrap:wrap}
+.select-filter{padding:9px 14px;border:1px solid var(--border);border-radius:8px;
+font-size:12px;font-weight:600;color:var(--slate);background:#F8FAFC;cursor:pointer}
+.client-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:16px}
+.client-card{background:var(--card-bg);border:1px solid var(--border);border-radius:14px;
+padding:18px;box-shadow:var(--shadow);display:flex;flex-direction:column;
+justify-content:space-between;position:relative}
+.client-card:hover{box-shadow:var(--shadow-lg)}
+.card-top{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:12px;gap:8px}
+.c-name{font-size:16px;font-weight:700;line-height:1.2}
+.c-policy{font-size:11px;color:var(--muted);font-weight:500;margin-top:2px}
+.badge-company{background:#EFF6FF;color:#1D4ED8;padding:4px 10px;border-radius:8px;
+font-size:11px;font-weight:700;flex-shrink:0}
+.due-row{display:flex;align-items:center;justify-content:space-between;background:#F8FAFC;
+border:1px solid #E2E8F0;padding:8px 12px;border-radius:8px;margin-bottom:12px;
+font-size:12px;font-weight:600}
+.due-tag{padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700}
+.due-tag.urgent{background:#FEE2E2;color:#991B1B}
+.due-tag.warning{background:#FEF3C7;color:#92400E}
+.due-tag.good{background:#D1E7DD;color:#0F5132}
+.contact-details{font-size:12px;color:var(--slate);margin-bottom:14px;display:flex;
+flex-direction:column;gap:4px}
+.card-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:auto}
+.btn-action{display:flex;align-items:center;justify-content:center;gap:6px;padding:9px 12px;
+border-radius:8px;font-size:12px;font-weight:700;text-decoration:none;cursor:pointer;border:none}
+.btn-wa{background:#25D366;color:#fff}
+.btn-gm{background:#2563EB;color:#fff}
+.btn-pdf{grid-column:span 2;background:#F1F5F9;color:var(--slate);border:1px solid var(--border)}
+.btn-edit-float{position:absolute;top:12px;right:12px;background:none;border:none;
+color:var(--muted);cursor:pointer;font-size:13px;padding:4px;border-radius:4px}
+.modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.6);display:flex;
+align-items:center;justify-content:center;z-index:200;padding:20px}
+.modal-box{background:#fff;border-radius:14px;padding:24px;max-width:440px;width:100%}
+.modal-title{font-size:16px;font-weight:800;margin-bottom:14px}
+.form-group{margin-bottom:12px}
+.form-label{display:block;font-size:11px;font-weight:700;color:var(--muted);
+margin-bottom:4px;text-transform:uppercase}
+.form-input{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-size:13px}
+.modal-btns{display:flex;gap:8px;justify-content:flex-end;margin-top:18px}
+.btn-cancel{background:#F1F5F9;color:var(--slate);border:none;padding:8px 16px;
+border-radius:8px;font-size:13px;font-weight:600;cursor:pointer}
+.btn-save-modal{background:var(--primary);color:#fff;border:none;padding:8px 18px;
+border-radius:8px;font-size:13px;font-weight:700;cursor:pointer}
+.loading-container{text-align:center;padding:60px 20px;color:var(--muted)}
+.spinner{border:3px solid #E2E8F0;border-top:3px solid var(--primary);border-radius:50%;
+width:36px;height:36px;animation:spin .8s linear infinite;margin:0 auto 14px}
+@keyframes spin{0%{transform:rotate(0)}100%{transform:rotate(360deg)}}
+.empty-state{text-align:center;padding:60px 20px;background:#fff;border-radius:12px;
+border:1px solid var(--border)}
+.hidden{display:none!important}
+footer{text-align:center;padding:20px;font-size:12px;color:var(--muted);margin-top:auto;
+border-top:1px solid var(--border);background:#fff}
+</style>
+</head>
+<body>
+<nav class="top-nav">
+  <div class="nav-brand">
+    <div class="brand-icon">&#128737;</div>
+    <div>
+      <div class="brand-title">Ajay Thakkar | Insurance Renewal Portal</div>
+      <div class="brand-subtitle">at-insurance.health &bull; 9818357595</div>
+    </div>
+  </div>
+  <button class="btn-sync" onclick="loadDashboard()">Sync Data</button>
+</nav>
+
+<div class="container">
+  <div class="stats-grid">
+    <div class="stat-card"><div class="stat-icon blue">&#128203;</div>
+      <div><div class="stat-value" id="kpi-total">0</div><div class="stat-label">Total Active Policies</div></div></div>
+    <div class="stat-card"><div class="stat-icon red">&#128680;</div>
+      <div><div class="stat-value" id="kpi-urgent">0</div><div class="stat-label">Due in 7 Days (Urgent)</div></div></div>
+    <div class="stat-card"><div class="stat-icon amber">&#128197;</div>
+      <div><div class="stat-value" id="kpi-month">0</div><div class="stat-label">Due in 30 Days</div></div></div>
+    <div class="stat-card"><div class="stat-icon green">&#9888;</div>
+      <div><div class="stat-value" id="kpi-review">0</div><div class="stat-label">Needs Review / Errors</div></div></div>
+  </div>
+
+  <div class="upload-card" id="drop-zone">
+    <div class="upload-icon">&#128228;</div>
+    <div class="upload-title">Drag &amp; Drop Renewal PDFs Here</div>
+    <div class="upload-desc">Or click below to browse files from your computer or phone</div>
+    <label class="btn-browse">Select Renewal Notices (PDF)
+      <input type="file" id="file-input" class="file-input" multiple accept=".pdf,application/pdf"></label>
+    <div id="queue-container" class="hidden">
+      <div class="queued-files-list" id="queued-list"></div>
+      <button class="btn-process-now" id="btn-process" onclick="uploadAndProcessFiles()">Upload &amp; Process with Gemini AI</button>
+    </div>
+    <div id="upload-status" class="hidden" style="margin-top:14px;font-weight:600;font-size:13px;color:var(--primary)"></div>
+  </div>
+
+  <div class="controls-bar">
+    <div class="search-box"><span class="search-icon">&#128269;</span>
+      <input type="text" id="search-input" class="search-input" placeholder="Search by Client Name, Policy No, Phone, or Company..." oninput="filterClients()"></div>
+    <div class="filter-group">
+      <select id="filter-month" class="select-filter" onchange="filterClients()"><option value="ALL">All Months</option></select>
+      <select id="filter-company" class="select-filter" onchange="filterClients()"><option value="ALL">All Insurers</option></select>
+      <select id="filter-urgency" class="select-filter" onchange="filterClients()">
+        <option value="ALL">All Deadlines</option>
+        <option value="URGENT">Due in 7 Days</option>
+        <option value="MONTH">Due in 30 Days</option>
+        <option value="OVERDUE">Overdue</option>
+        <option value="REVIEW">Needs Review</option>
+      </select>
+    </div>
+  </div>
+
+  <div id="loading-state" class="loading-container">
+    <div class="spinner"></div><p>Loading renewal records from Google Sheets...</p></div>
+
+  <div id="empty-state" class="empty-state hidden">
+    <div style="font-size:40px;margin-bottom:10px">&#128196;</div>
+    <h3 style="font-size:16px;font-weight:700">No Renewal Notices Found</h3>
+    <p style="font-size:12px;color:var(--muted);margin-top:4px">Upload PDFs using the box above to get started.</p></div>
+
+  <div class="client-grid" id="client-grid"></div>
+</div>
+
+<div id="edit-modal" class="modal-backdrop hidden">
+  <div class="modal-box">
+    <div class="modal-title">Edit Client Contact</div>
+    <input type="hidden" id="edit-row">
+    <div class="form-group"><label class="form-label">Client Name</label>
+      <input type="text" id="edit-name" class="form-input" disabled style="background:#F1F5F9"></div>
+    <div class="form-group"><label class="form-label">Policy Number</label>
+      <input type="text" id="edit-policy" class="form-input"></div>
+    <div class="form-group"><label class="form-label">Mobile Number (WhatsApp)</label>
+      <input type="text" id="edit-mobile" class="form-input" placeholder="10-digit mobile number"></div>
+    <div class="form-group"><label class="form-label">Email Address</label>
+      <input type="email" id="edit-email" class="form-input" placeholder="client@example.com"></div>
+    <div class="modal-btns">
+      <button class="btn-cancel" onclick="closeModal()">Cancel</button>
+      <button class="btn-save-modal" onclick="saveModalChanges()">Save Changes</button></div>
+  </div>
+</div>
+
+<footer><b>Insurance Renewal Automation Engine</b> &bull; Google Apps Script &amp; Gemini Flash</footer>
+
+<script>
+var allClients = [];
+var queuedFiles = [];
+
+window.onload = function () { loadDashboard(); setupDragDrop(); };
+
+function loadDashboard() {
+  document.getElementById('loading-state').classList.remove('hidden');
+  document.getElementById('client-grid').classList.add('hidden');
+  document.getElementById('empty-state').classList.add('hidden');
+  google.script.run.withSuccessHandler(renderDashboard).withFailureHandler(handleError).fetchDashboardData();
+}
+
+function renderDashboard(data) {
+  document.getElementById('loading-state').classList.add('hidden');
+  if (data.error) { alert('Error: ' + data.error); return; }
+  document.getElementById('kpi-total').innerText = data.stats.total;
+  document.getElementById('kpi-urgent').innerText = data.stats.dueIn7Days;
+  document.getElementById('kpi-month').innerText = data.stats.dueIn30Days;
+  document.getElementById('kpi-review').innerText = data.stats.needsReview;
+
+  var ms = document.getElementById('filter-month');
+  ms.innerHTML = '<option value="ALL">All Months</option>';
+  data.months.forEach(function (m) {
+    var o = document.createElement('option'); o.value = m; o.innerText = m; ms.appendChild(o);
+  });
+
+  var cs = document.getElementById('filter-company');
+  cs.innerHTML = '<option value="ALL">All Insurers</option>';
+  data.companies.forEach(function (c) {
+    var o = document.createElement('option'); o.value = c; o.innerText = c; cs.appendChild(o);
+  });
+
+  allClients = data.clients || [];
+  filterClients();
+}
+
+function filterClients() {
+  var q = document.getElementById('search-input').value.toLowerCase().trim();
+  var sm = document.getElementById('filter-month').value;
+  var sc = document.getElementById('filter-company').value;
+  var su = document.getElementById('filter-urgency').value;
+
+  var filtered = allClients.filter(function (c) {
+    var mq = !q || c.clientName.toLowerCase().indexOf(q) !== -1 ||
+      c.policyNo.toLowerCase().indexOf(q) !== -1 || c.mobile.toLowerCase().indexOf(q) !== -1 ||
+      c.email.toLowerCase().indexOf(q) !== -1 || c.company.toLowerCase().indexOf(q) !== -1;
+    var mm = (sm === 'ALL') || (c.month === sm);
+    var mc = (sc === 'ALL') || (c.company === sc);
+    var mu = true;
+    if (su === 'URGENT') mu = c.daysRemaining !== null && c.daysRemaining >= 0 && c.daysRemaining <= 7;
+    else if (su === 'MONTH') mu = c.daysRemaining !== null && c.daysRemaining >= 0 && c.daysRemaining <= 30;
+    else if (su === 'OVERDUE') mu = c.daysRemaining !== null && c.daysRemaining < 0;
+    else if (su === 'REVIEW') mu = c.status === 'NEEDS REVIEW' || c.status === 'ERROR';
+    return mq && mm && mc && mu;
+  });
+
+  renderClientCards(filtered);
+}
+
+function renderClientCards(clients) {
+  var grid = document.getElementById('client-grid');
+  var empty = document.getElementById('empty-state');
+
+  if (!clients || clients.length === 0) {
+    grid.innerHTML = ''; grid.classList.add('hidden'); empty.classList.remove('hidden'); return;
+  }
+  empty.classList.add('hidden'); grid.classList.remove('hidden'); grid.innerHTML = '';
+
+  clients.forEach(function (c) {
+    var card = document.createElement('div');
+    card.className = 'client-card';
+
+    var tag = '';
+    if (c.daysRemaining !== null) {
+      if (c.daysRemaining < 0) tag = '<span class="due-tag urgent">Overdue (' + Math.abs(c.daysRemaining) + 'd ago)</span>';
+      else if (c.daysRemaining <= 7) tag = '<span class="due-tag urgent">Due in ' + c.daysRemaining + ' days</span>';
+      else if (c.daysRemaining <= 30) tag = '<span class="due-tag warning">' + c.daysRemaining + ' days left</span>';
+      else tag = '<span class="due-tag good">' + c.daysRemaining + ' days left</span>';
+    } else {
+      tag = '<span class="due-tag warning">Check Date</span>';
+    }
+
+    card.innerHTML =
+      '<button class="btn-edit-float" onclick="openEditModal(' + c.rowIndex + ')">Edit</button>' +
+      '<div><div class="card-top"><div>' +
+      '<div class="c-name">' + (c.clientName || 'Unknown Client') + '</div>' +
+      '<div class="c-policy">Policy: ' + (c.policyNo || '-') + '</div></div>' +
+      '<div class="badge-company">' + (c.company || 'INSURANCE') + '</div></div>' +
+      '<div class="due-row"><span>Due: <b>' + (c.renewalDate || '-') + '</b></span>' + tag + '</div>' +
+      '<div class="contact-details"><div>Phone: <b>' + (c.mobile || 'No phone') + '</b></div>' +
+      '<div>Email: <b>' + (c.email || 'No email') + '</b></div></div></div>' +
+      '<div class="card-actions">' +
+      '<a href="' + c.whatsappUrl + '" target="_blank" class="btn-action btn-wa">WhatsApp</a>' +
+      '<a href="' + c.gmailUrl + '" target="_blank" class="btn-action btn-gm">Gmail</a>' +
+      (c.fileUrl ? '<a href="' + c.fileUrl + '" target="_blank" class="btn-action btn-pdf">View PDF Notice</a>' : '') +
+      '</div>';
+
+    grid.appendChild(card);
+  });
+}
+
+function openEditModal(rowIndex) {
+  var client = null;
+  for (var i = 0; i < allClients.length; i++) {
+    if (allClients[i].rowIndex === rowIndex) { client = allClients[i]; break; }
+  }
+  if (!client) return;
+  document.getElementById('edit-row').value = client.rowIndex;
+  document.getElementById('edit-name').value = client.clientName;
+  document.getElementById('edit-policy').value = client.policyNo;
+  document.getElementById('edit-mobile').value = client.mobile;
+  document.getElementById('edit-email').value = client.email;
+  document.getElementById('edit-modal').classList.remove('hidden');
+}
+
+function closeModal() { document.getElementById('edit-modal').classList.add('hidden'); }
+
+function saveModalChanges() {
+  var row = parseInt(document.getElementById('edit-row').value, 10);
+  var p = document.getElementById('edit-policy').value.trim();
+  var m = document.getElementById('edit-mobile').value.trim();
+  var e = document.getElementById('edit-email').value.trim();
+  closeModal();
+  document.getElementById('loading-state').classList.remove('hidden');
+  google.script.run.withSuccessHandler(function () { loadDashboard(); })
+    .withFailureHandler(handleError).saveClientFromWeb(row, m, e, p);
+}
+
+function setupDragDrop() {
+  var dz = document.getElementById('drop-zone');
+  var fi = document.getElementById('file-input');
+  dz.addEventListener('dragover', function (e) { e.preventDefault(); dz.classList.add('dragover'); });
+  dz.addEventListener('dragleave', function () { dz.classList.remove('dragover'); });
+  dz.addEventListener('drop', function (e) {
+    e.preventDefault(); dz.classList.remove('dragover');
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) handleSelectedFiles(e.dataTransfer.files);
+  });
+  fi.addEventListener('change', function (e) {
+    if (e.target.files && e.target.files.length > 0) handleSelectedFiles(e.target.files);
+  });
+}
+
+function handleSelectedFiles(files) {
+  for (var i = 0; i < files.length; i++) {
+    var f = files[i];
+    if (f.name.toLowerCase().indexOf('.pdf') !== -1 || f.type === 'application/pdf') queuedFiles.push(f);
+  }
+  renderQueue();
+}
+
+function renderQueue() {
+  var qList = document.getElementById('queued-list');
+  var qc = document.getElementById('queue-container');
+  if (queuedFiles.length === 0) { qc.classList.add('hidden'); return; }
+  qc.classList.remove('hidden');
+  qList.innerHTML = '';
+  queuedFiles.forEach(function (file, idx) {
+    var item = document.createElement('div');
+    item.className = 'queued-item';
+    item.innerHTML = '<span>' + file.name + ' (' + Math.round(file.size / 1024) + ' KB)</span>' +
+      '<span class="queued-remove" onclick="removeQueued(' + idx + ')">&#10006;</span>';
+    qList.appendChild(item);
+  });
+}
+
+function removeQueued(idx) { queuedFiles.splice(idx, 1); renderQueue(); }
+
+function uploadAndProcessFiles() {
+  if (queuedFiles.length === 0) return;
+  var statusEl = document.getElementById('upload-status');
+  var btn = document.getElementById('btn-process');
+  btn.disabled = true;
+  btn.innerText = 'Uploading & Processing...';
+  statusEl.classList.remove('hidden');
+  statusEl.innerText = 'Encoding ' + queuedFiles.length + ' PDF files...';
+
+  var fileDataList = [];
+  var pending = queuedFiles.length;
+
+  queuedFiles.forEach(function (file) {
+    var reader = new FileReader();
+    reader.onload = function () {
+      var b64 = reader.result.split(',')[1] || reader.result;
+      fileDataList.push({ name: file.name, type: file.type || 'application/pdf', base64: b64 });
+      pending--;
+      if (pending === 0) sendToServer(fileDataList, statusEl, btn);
+    };
+    reader.onerror = function () { pending--; if (pending === 0) sendToServer(fileDataList, statusEl, btn); };
+    reader.readAsDataURL(file);
+  });
+}
+
+function sendToServer(fileDataList, statusEl, btn) {
+  var elapsed = 0;
+  statusEl.innerText = 'Processing ' + fileDataList.length + ' PDFs with Gemini AI... (0.0s)';
+  var timer = setInterval(function () {
+    elapsed += 0.5;
+    statusEl.innerText = 'Processing ' + fileDataList.length + ' PDFs with Gemini AI... (' + elapsed.toFixed(1) + 's)';
+  }, 500);
+
+  google.script.run
+    .withSuccessHandler(function (res) {
+      clearInterval(timer);
+      var t = res.elapsedSeconds || elapsed.toFixed(1);
+      var msg = 'Done in ' + t + 's. Processed ' + res.processed + ' notices (' +
+        res.success + ' successful, ' + res.needsReview + ' needs review)';
+      if (res.overloaded > 0) msg += '. ' + res.overloaded + ' hit a temporary model overload - retry in a few minutes.';
+      statusEl.innerText = msg;
+      queuedFiles = [];
+      renderQueue();
+      btn.disabled = false;
+      btn.innerText = 'Upload & Process with Gemini AI';
+      setTimeout(function () { statusEl.classList.add('hidden'); loadDashboard(); }, 3000);
+    })
+    .withFailureHandler(function (err) {
+      clearInterval(timer);
+      handleError(err);
+      btn.disabled = false;
+      btn.innerText = 'Upload & Process with Gemini AI';
+      statusEl.classList.add('hidden');
+    })
+    .uploadFilesAndProcess(fileDataList);
+}
+
+function handleError(err) {
+  document.getElementById('loading-state').classList.add('hidden');
+  alert('Error: ' + (err.message || err.toString()));
+}
+</script>
+</body>
+</html>`;
+}
