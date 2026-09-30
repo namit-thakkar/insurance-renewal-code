@@ -31,17 +31,17 @@ const CONFIG = {
   // New API keys are blocked from gemini-2.5-flash-lite, and Gemini 3.5+
   // returns HTTP 400 if temperature is sent. Prefer 3.5 Flash-Lite.
   // Still ONE model per run after the first successful hit.
-  GEMINI_MODEL: 'gemini-3.5-flash-lite',
-  GEMINI_FALLBACK_MODELS: ['gemini-3.1-flash-lite', 'gemini-2.5-flash-lite'],
+  GEMINI_MODEL: 'gemini-flash-lite-latest',
+  GEMINI_FALLBACK_MODELS: ['gemini-3.1-flash-lite', 'gemini-2.5-flash'],
 
   // Parallel Batch Concurrency (all files fire in one parallel round)
-  CONCURRENCY: 10,
+  CONCURRENCY: 1,
 
   // Batch Execution Limit
   MAX_FILES_PER_RUN: 10,
 
   // Tiny pause used ONLY when a 503/429 retry is needed (ms)
-  RETRY_PAUSE_MS: 400,
+  RETRY_PAUSE_MS: 4000,
 
   // Safety cutoff so the script never hits the hard Apps Script timeout mid-write
   MAX_RUNTIME_MS: 280000,
@@ -64,7 +64,7 @@ const CONFIG = {
   PROP_MODELS_LIST: 'CACHED_GEMINI_MODEL_LIST',
 
   // Preferred first. 2.5 is last because new keys are rejected.
-  MODEL_PRIORITY: ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-2.5-flash-lite'],
+  MODEL_PRIORITY: ['gemini-flash-lite-latest', 'gemini-3.1-flash-lite', 'gemini-2.5-flash'],
 
   // Master Sheet Column Indices (1-indexed)
   COLS: {
@@ -734,18 +734,10 @@ function extractTextFromPdfBlob(blob) {
  * Decides whether scraped text is real document text or compressed-stream garbage.
  */
 function scoreExtractedText(text) {
-  if (!text || text.length < 80) return { ok: false, why: 'too short' };
-
-  const words = text.match(/[A-Za-z]{4,}/g) || [];
-  const letters = (text.match(/[A-Za-z]/g) || []).length;
-  const letterRatio = letters / text.length;
-  const avgTokenLen = text.length / Math.max(1, (text.split(/\s+/).length));
-
-  if (words.length < 15) return { ok: false, why: 'only ' + words.length + ' real words' };
-  if (letterRatio < 0.45) return { ok: false, why: 'letter ratio ' + letterRatio.toFixed(2) };
-  if (avgTokenLen < 1.8) return { ok: false, why: 'fragmented tokens' };
-
-  return { ok: true, why: 'ok (' + words.length + ' words, ratio ' + letterRatio.toFixed(2) + ')' };
+  if (!text || text.length < 40) return { ok: false, why: 'too short' };
+  const words = text.match(/[A-Za-z]{3,}/g) || [];
+  if (words.length < 5) return { ok: false, why: 'only ' + words.length + ' real words' };
+  return { ok: true, why: 'ok (' + words.length + ' words)' };
 }
 
 // ======================================================================================
@@ -758,9 +750,9 @@ function scoreExtractedText(text) {
  * fastest setting for the model family. b64 is returned so retries reuse it.
  */
 function thinkingConfigFor(model) {
-  const m = String(model || '');
-  if (m.indexOf('2.5') !== -1) return { thinkingBudget: 0 };
-  return { thinkingLevel: 'minimal' };
+  // Leave thinking at the model default. Sending thinkingLevel / thinkingBudget
+  // is a common HTTP 400 on current Flash / Flash-Lite keys.
+  return null;
 }
 
 function listGeminiCandidates() {
@@ -778,31 +770,48 @@ function listGeminiCandidates() {
  * gemini-2.5-flash-lite 404s for many new keys; 3.5-flash-lite is the replacement.
  * Result is cached in Script Properties so later runs skip the probe.
  */
+function listLiveFlashModels(apiKey) {
+  try {
+    const res = UrlFetchApp.fetch(
+      'https://generativelanguage.googleapis.com/' + CONFIG.GEMINI_API_VERSION +
+      '/models?key=' + apiKey + '&pageSize=100',
+      { muteHttpExceptions: true }
+    );
+    if (res.getResponseCode() !== 200) return [];
+    const json = JSON.parse(res.getContentText());
+    const names = [];
+    (json.models || []).forEach(function (m) {
+      const name = String(m.name || '').replace(/^models\//, '');
+      const methods = m.supportedGenerationMethods || [];
+      if (methods.indexOf('generateContent') === -1) return;
+      if (name.indexOf('flash') === -1) return;
+      if (name.indexOf('image') !== -1 || name.indexOf('tts') !== -1 || name.indexOf('live') !== -1) return;
+      names.push(name);
+    });
+    return names;
+  } catch (e) {
+    return [];
+  }
+}
+
 function resolveWorkingGeminiModel(apiKey) {
   if (_ACTIVE_WORKING_MODEL) return _ACTIVE_WORKING_MODEL;
 
   const props = PropertiesService.getScriptProperties();
   const candidates = listGeminiCandidates();
-  const cached = props.getProperty(CONFIG.PROP_ACTIVE_MODEL);
-  if (cached && candidates.indexOf(cached) !== -1) {
-    _ACTIVE_WORKING_MODEL = cached;
-    return cached;
-  }
 
   for (let i = 0; i < candidates.length; i++) {
     const model = candidates[i];
-    const url = 'https://generativelanguage.googleapis.com/' + CONFIG.GEMINI_API_VERSION +
-                '/models/' + model + ':generateContent?key=' + apiKey;
     try {
-      const res = UrlFetchApp.fetch(url, {
+      const res = UrlFetchApp.fetch(
+        'https://generativelanguage.googleapis.com/' + CONFIG.GEMINI_API_VERSION +
+        '/models/' + model + ':generateContent',
+        {
         method: 'post',
         contentType: 'application/json',
+        headers: { 'x-goog-api-key': apiKey },
         payload: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: 'Reply with the single word CONNECTED.' }] }],
-          generationConfig: {
-            maxOutputTokens: 16,
-            thinkingConfig: thinkingConfigFor(model)
-          }
+          contents: [{ parts: [{ text: 'Reply with the single word CONNECTED.' }] }]
         }),
         muteHttpExceptions: true
       });
@@ -822,6 +831,10 @@ function resolveWorkingGeminiModel(apiKey) {
   return _ACTIVE_WORKING_MODEL;
 }
 
+function usedModelSafe(model) {
+  return String(model || '');
+}
+
 function nextGeminiFallback(current) {
   const candidates = listGeminiCandidates();
   const idx = candidates.indexOf(current);
@@ -829,56 +842,27 @@ function nextGeminiFallback(current) {
   return candidates[idx + 1] || '';
 }
 function buildGeminiRequest(blob, apiKey, model, forcePdf, cachedB64) {
-  let parts;
-  let mode = 'pdf';
-  let b64 = cachedB64 || '';
-
-  const digitalText = forcePdf ? null : extractTextFromPdfBlob(blob);
-
-  if (digitalText && digitalText.length > 80) {
-    mode = 'text';
-    parts = [{
-      text: 'Extract insurance renewal notice fields from this document text into JSON:\n' +
-            '--- DOCUMENT TEXT ---\n' + digitalText + '\n---------------------\n\n' +
-            'Return ONLY valid JSON matching this schema:\n' +
-            '{"clientName":"","renewalDate":"YYYY-MM-DD","insuranceCompany":"","policyNumber":"","clientMobile":"","clientEmail":""}'
-    }];
-  } else {
-    if (!b64) b64 = Utilities.base64Encode(blob.getBytes());
-    parts = [
-      {
-        text: 'Extract insurance renewal notice fields into JSON:\n' +
-              '- clientName: Policyholder full legal name\n' +
-              '- renewalDate: Due date strictly in YYYY-MM-DD format\n' +
-              '- insuranceCompany: Insurer company name\n' +
-              '- policyNumber: Policy number (or empty string)\n' +
-              '- clientMobile: Contact phone number (or empty string)\n' +
-              '- clientEmail: Contact email (or empty string)\n\n' +
-              'Return ONLY valid JSON matching:\n' +
-              '{"clientName":"","renewalDate":"","insuranceCompany":"","policyNumber":"","clientMobile":"","clientEmail":""}'
-      },
-      { inlineData: { mimeType: 'application/pdf', data: b64 } }
-    ];
-  }
-
-  const payload = {
-    contents: [{ role: 'user', parts: parts }],
-    generationConfig: {
-      maxOutputTokens: 1024,
-      responseMimeType: 'application/json',
-      thinkingConfig: thinkingConfigFor(model)
-    }
-  };
+  const fileName = (blob && blob.getName) ? String(blob.getName() || '') : '';
+  const digitalText = extractTextFromPdfBlob(blob) || '';
+  const prompt =
+    'Extract insurance renewal notice fields from this text. Return ONLY JSON with keys ' +
+    'clientName, renewalDate (YYYY-MM-DD), insuranceCompany, policyNumber, clientMobile, clientEmail.\n' +
+    'File name: ' + fileName + '\n\n' +
+    (digitalText || '(no digital text)');
 
   return {
-    mode: mode,
-    b64: b64,
+    mode: digitalText ? 'text' : 'empty',
+    b64: '',
+    textLen: digitalText.length,
     req: {
       url: 'https://generativelanguage.googleapis.com/' + CONFIG.GEMINI_API_VERSION +
-           '/models/' + model + ':generateContent?key=' + apiKey,
+           '/models/' + model + ':generateContent',
       method: 'post',
       contentType: 'application/json',
-      payload: JSON.stringify(payload),
+      headers: { 'x-goog-api-key': apiKey },
+      payload: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }]
+      }),
       muteHttpExceptions: true
     }
   };
@@ -915,7 +899,14 @@ function parseGeminiResponse(resp) {
     }
     return result;
   }
-  if (result.httpCode !== 200) { result.reason = 'HTTP ' + result.httpCode; return result; }
+  if (result.httpCode !== 200) {
+    var body = '';
+    try { body = String(resp.getContentText() || ''); } catch (e2) {}
+    var msg = '';
+    try { msg = String((JSON.parse(body).error || {}).message || ''); } catch (e3) {}
+    result.reason = ('HTTP ' + result.httpCode + (msg ? (': ' + msg) : '')).substring(0, 220);
+    return result;
+  }
 
   try {
     const json = JSON.parse(resp.getContentText());
@@ -1009,87 +1000,47 @@ function processBatchConcurrent(filesToProcess, masterFolder, reviewFolder, mast
   fetchFileBlobsParallel(items);
   Logger.log('Parallel download: ' + ((Date.now() - t) / 1000).toFixed(2) + 's');
 
-  // ---- Step 3: ONE parallel Gemini round (PDF, thinking off) -----------------------
+  // ---- Step 3: one file at a time on the model that is actually up ----
   t = Date.now();
-  const requests = [];
   const active = [];
+  const candidates = listGeminiCandidates();
+  let usedModel = model;
+
   items.forEach(function (it) {
     if (!it.blob) { it.reason = 'PDF content could not be read from Drive'; return; }
-    const built = buildGeminiRequest(it.blob, apiKey, model, true);
-    it.mode = built.mode;
-    it.b64 = built.b64;
-    requests.push(built.req);
     active.push(it);
-  });
-
-  const responses = safeFetchAll(requests, CONFIG.CONCURRENCY);
-  for (let i = 0; i < active.length; i++) {
-    const r = parseGeminiResponse(responses[i]);
-    active[i].extraction = r.data;
-    if (!r.data) active[i].reason = r.reason;
-  }
-  Logger.log('Parallel Gemini round: ' + ((Date.now() - t) / 1000).toFixed(2) + 's');
-
-  // If the preferred model 404'd (common for gemini-2.5-flash-lite on new keys),
-  // swap to the next Flash-Lite and rerun the same encoded PDFs immediately.
-  let usedModel = model;
-  if (active.length > 0) {
-    const allBadModel = active.every(function (it) {
-      return it.reason && (it.reason.indexOf('404') !== -1 || it.reason.indexOf('400') !== -1);
-    });
-    const fallback = allBadModel ? nextGeminiFallback(usedModel) : '';
-    if (fallback) {
-      Logger.log(usedModel + ' rejected the request — switching to ' + fallback);
-      usedModel = fallback;
-      _ACTIVE_WORKING_MODEL = fallback;
-      try { PropertiesService.getScriptProperties().setProperty(CONFIG.PROP_ACTIVE_MODEL, fallback); } catch (e) {}
-
-      t = Date.now();
-      const swapReqs = active.map(function (it) {
-        return buildGeminiRequest(it.blob, apiKey, usedModel, true, it.b64).req;
-      });
-      const swapRes = safeFetchAll(swapReqs, CONFIG.CONCURRENCY);
-      for (let i = 0; i < active.length; i++) {
-        const r = parseGeminiResponse(swapRes[i]);
-        active[i].extraction = r.data;
-        active[i].reason = r.data ? '' : r.reason;
-      }
-      Logger.log('Fallback Gemini round (' + usedModel + '): ' + ((Date.now() - t) / 1000).toFixed(2) + 's');
-    }
-  }
-
-  // ---- Step 4: retry ONLY transient failures (same working model, reuse encoded PDF) -------
-  if (Date.now() - startTime < CONFIG.MAX_RUNTIME_MS) {
-    const retryItems = [];
-    active.forEach(function (it) {
-      if (validateExtraction(it.extraction).isValid) return;
-      if (isTransientGeminiFailure(it.reason)) retryItems.push(it);
-    });
-
-    if (retryItems.length > 0) {
-      const needPause = retryItems.some(function (it) {
-        return it.reason && (it.reason.indexOf('503') !== -1 || it.reason.indexOf('429') !== -1);
-      });
-      Logger.log('Retrying ' + retryItems.length + ' transient failure(s) on ' + usedModel);
-      if (needPause) Utilities.sleep(CONFIG.RETRY_PAUSE_MS);
-
-      const retryReqs = retryItems.map(function (it) {
-        return buildGeminiRequest(it.blob, apiKey, usedModel, true, it.b64).req;
-      });
-      const retryRes = safeFetchAll(retryReqs, CONFIG.CONCURRENCY);
-
-      for (let i = 0; i < retryItems.length; i++) {
-        const r = parseGeminiResponse(retryRes[i]);
-        if (r.data && validateExtraction(r.data).isValid) {
-          retryItems[i].extraction = r.data;
-          retryItems[i].reason = '';
-        } else {
-          if (!retryItems[i].extraction && r.data) retryItems[i].extraction = r.data;
-          if (r.reason) retryItems[i].reason = r.reason;
+    let done = false;
+    for (let m = 0; m < candidates.length && !done; m++) {
+      const tryModel = candidates[m];
+      for (let attempt = 0; attempt < 3 && !done; attempt++) {
+        if (Date.now() - startTime > CONFIG.MAX_RUNTIME_MS) break;
+        if (attempt > 0) Utilities.sleep(CONFIG.RETRY_PAUSE_MS * attempt);
+        const built = buildGeminiRequest(it.blob, apiKey, tryModel, false);
+        let resp = null;
+        try {
+          resp = UrlFetchApp.fetch(built.req.url, built.req);
+        } catch (e) {
+          it.reason = e.message + ' [' + tryModel + ']';
+          continue;
         }
+        const r = parseGeminiResponse(resp);
+        if (r.data) {
+          it.extraction = r.data;
+          it.reason = '';
+          usedModel = tryModel;
+          _ACTIVE_WORKING_MODEL = tryModel;
+          done = true;
+          break;
+        }
+        it.reason = (r.reason || 'empty') + ' [' + tryModel + ']';
+        const badModel = it.reason.indexOf('404') !== -1 || it.reason.indexOf('400') !== -1;
+        if (badModel) break;
+        if (!isTransientGeminiFailure(it.reason)) break;
       }
     }
-  }
+    Utilities.sleep(1500);
+  });
+  Logger.log('Gemini round: ' + ((Date.now() - t) / 1000).toFixed(2) + 's using ' + usedModel);
 
   items.forEach(function (it) { it.blob = null; it.b64 = ''; });
 
@@ -2250,15 +2201,15 @@ function testGeminiConnection() {
     const url = 'https://generativelanguage.googleapis.com/' + CONFIG.GEMINI_API_VERSION +
                 '/models/' + testModel + ':generateContent?key=' + apiKey;
     try {
-      const res = UrlFetchApp.fetch(url, {
+      const res = UrlFetchApp.fetch(
+        'https://generativelanguage.googleapis.com/' + CONFIG.GEMINI_API_VERSION +
+        '/models/' + testModel + ':generateContent',
+        {
         method: 'post',
         contentType: 'application/json',
+        headers: { 'x-goog-api-key': apiKey },
         payload: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: 'Reply with the single word CONNECTED.' }] }],
-          generationConfig: {
-            maxOutputTokens: 16,
-            thinkingConfig: thinkingConfigFor(testModel)
-          }
+          contents: [{ parts: [{ text: 'Reply with the single word CONNECTED.' }] }]
         }),
         muteHttpExceptions: true
       });
