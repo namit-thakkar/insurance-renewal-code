@@ -734,10 +734,15 @@ function extractTextFromPdfBlob(blob) {
  * Decides whether scraped text is real document text or compressed-stream garbage.
  */
 function scoreExtractedText(text) {
-  if (!text || text.length < 40) return { ok: false, why: 'too short' };
-  const words = text.match(/[A-Za-z]{3,}/g) || [];
-  if (words.length < 5) return { ok: false, why: 'only ' + words.length + ' real words' };
-  return { ok: true, why: 'ok (' + words.length + ' words)' };
+  if (!text || text.length < 80) return { ok: false, why: 'too short' };
+  const lower = text.toLowerCase();
+  const keys = ['policy', 'premium', 'renewal', 'insurance', 'expiry', 'customer', 'address'];
+  let hits = 0;
+  for (let i = 0; i < keys.length; i++) {
+    if (lower.indexOf(keys[i]) !== -1) hits++;
+  }
+  if (hits < 2) return { ok: false, why: 'compressed stream, not real text (' + hits + ' keywords)' };
+  return { ok: true, why: 'ok (' + hits + ' keywords)' };
 }
 
 // ======================================================================================
@@ -844,16 +849,38 @@ function nextGeminiFallback(current) {
 function buildGeminiRequest(blob, apiKey, model, forcePdf, cachedB64) {
   const fileName = (blob && blob.getName) ? String(blob.getName() || '') : '';
   const digitalText = extractTextFromPdfBlob(blob) || '';
-  const prompt =
-    'Extract insurance renewal notice fields from this text. Return ONLY JSON with keys ' +
-    'clientName, renewalDate (YYYY-MM-DD), insuranceCompany, policyNumber, clientMobile, clientEmail.\n' +
-    'File name: ' + fileName + '\n\n' +
-    (digitalText || '(no digital text)');
+  const rules =
+    'Return ONLY JSON with keys clientName, renewalDate, insuranceCompany, policyNumber, clientMobile, clientEmail.\n' +
+    'clientName is the person after "Name :". Do not use the intermediary (agent) name and do not use family member names.\n' +
+    'renewalDate is the Policy Expiry Date as YYYY-MM-DD, not the letter date.\n' +
+    'insuranceCompany is the insurer. policyNumber is Policy No. Mobile and email may be blank.\n' +
+    'File name: ' + fileName;
 
+  if (digitalText) {
+    return {
+      mode: 'text',
+      b64: '',
+      textLen: digitalText.length,
+      req: {
+        url: 'https://generativelanguage.googleapis.com/' + CONFIG.GEMINI_API_VERSION +
+             '/models/' + model + ':generateContent',
+        method: 'post',
+        contentType: 'application/json',
+        headers: { 'x-goog-api-key': apiKey },
+        payload: JSON.stringify({
+          contents: [{ parts: [{ text: rules + '\n\n' + digitalText }] }]
+        }),
+        muteHttpExceptions: true
+      }
+    };
+  }
+
+  let b64 = cachedB64 || '';
+  if (!b64 && blob) b64 = Utilities.base64Encode(blob.getBytes());
   return {
-    mode: digitalText ? 'text' : 'empty',
-    b64: '',
-    textLen: digitalText.length,
+    mode: 'pdf',
+    b64: b64,
+    textLen: 0,
     req: {
       url: 'https://generativelanguage.googleapis.com/' + CONFIG.GEMINI_API_VERSION +
            '/models/' + model + ':generateContent',
@@ -861,7 +888,10 @@ function buildGeminiRequest(blob, apiKey, model, forcePdf, cachedB64) {
       contentType: 'application/json',
       headers: { 'x-goog-api-key': apiKey },
       payload: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }]
+        contents: [{ parts: [
+          { text: rules },
+          { inlineData: { mimeType: 'application/pdf', data: b64 } }
+        ] }]
       }),
       muteHttpExceptions: true
     }
